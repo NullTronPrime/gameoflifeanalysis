@@ -248,48 +248,41 @@ static inline uint64_t next_word_rules(
     uint64_t bl, uint64_t bc, uint64_t br,
     uint8_t rule_B, uint8_t rule_S)
 {
-    // Horizontal pair sums for each of the 3 rows
-    auto hor = [](uint64_t L, uint64_t C, uint64_t R, uint64_t& s, uint64_t& c) {
-        uint64_t left  = (C<<1)|(L>>63);
-        uint64_t right = (C>>1)|(R<<63);
-        HALF_ADD(s, c, left, right);
+    // Bit-serial 8-neighbour counter.
+    // n3:n2:n1:n0 is a 4-bit per-cell count accumulated by adding each
+    // neighbour word one at a time via a ripple-carry increment.
+    // This correctly counts all 8 Moore neighbours including top-center
+    // and bot-center, which the previous carry-save approach omitted.
+    uint64_t n0=0, n1=0, n2=0, n3=0;
+
+    auto add = [&](uint64_t b) {
+        uint64_t c = n0 & b; n0 ^= b;
+        b = n1 & c;          n1 ^= c;
+        c = n2 & b;          n2 ^= b;
+                             n3 ^= c;
     };
-    uint64_t ts,tc2, ms,mc2, bs,bc2;
-    hor(tl,tc,tr, ts,tc2);
-    hor(ml,mc,mr, ms,mc2);
-    hor(bl,bc,br, bs,bc2);
 
-    // Vertical sum of three 2-bit row-sums → 4-bit count [a3:a2:a1:a0]
-    // Low bits
-    uint64_t s0,c0,s1,c1;
-    HALF_ADD(s0,c0, ts,ms);
-    FULL_ADD(s1,c1, s0,bs, 0ULL);
+    add((tc<<1)|(tl>>63));  // top-left
+    add(tc);                 // top-center
+    add((tc>>1)|(tr<<63));  // top-right
+    add((mc<<1)|(ml>>63));  // mid-left
+    // mc (self) is excluded — not a neighbour of itself
+    add((mc>>1)|(mr<<63));  // mid-right
+    add((bc<<1)|(bl>>63));  // bot-left
+    add(bc);                 // bot-center
+    add((bc>>1)|(br<<63));  // bot-right
 
-    // High bits (carries from horizontal sums × 2)
-    uint64_t h0,hc0,h1,hc1,carry;
-    HALF_ADD(h0,hc0, tc2,mc2);
-    FULL_ADD(h1,hc1, h0,bc2, 0ULL);
-    // (hc0 and hc1 would give bit 3+, which can only be non-zero if count≥8)
-
-    // Combine: count = 2*(tc2+mc2+bc2) + (ts+ms+bs)
-    uint64_t a0,a1,a2,a3;
-    a0 = s1;
-    HALF_ADD(a1, carry, c1, h0);
-    uint64_t c2a; HALF_ADD(a2, c2a, carry, h1);
-    a3 = c2a ^ hc0 ^ hc1;  // bit 3: count=8 only
-
-    // Decode count masks 0..8 from 4-bit a3:a2:a1:a0
-    // count = 8*a3 + 4*a2 + 2*a1 + a0
+    // Decode 4-bit count n3:n2:n1:n0 into per-count masks
     uint64_t cnt[9];
-    cnt[0] = ~a3 & ~a2 & ~a1 & ~a0;
-    cnt[1] = ~a3 & ~a2 & ~a1 &  a0;
-    cnt[2] = ~a3 & ~a2 &  a1 & ~a0;
-    cnt[3] = ~a3 & ~a2 &  a1 &  a0;
-    cnt[4] = ~a3 &  a2 & ~a1 & ~a0;
-    cnt[5] = ~a3 &  a2 & ~a1 &  a0;
-    cnt[6] = ~a3 &  a2 &  a1 & ~a0;
-    cnt[7] = ~a3 &  a2 &  a1 &  a0;
-    cnt[8] =  a3 & ~a2 & ~a1 & ~a0;  // all 8 neighbours alive
+    cnt[0] = ~n3 & ~n2 & ~n1 & ~n0;
+    cnt[1] = ~n3 & ~n2 & ~n1 &  n0;
+    cnt[2] = ~n3 & ~n2 &  n1 & ~n0;
+    cnt[3] = ~n3 & ~n2 &  n1 &  n0;
+    cnt[4] = ~n3 &  n2 & ~n1 & ~n0;
+    cnt[5] = ~n3 &  n2 & ~n1 &  n0;
+    cnt[6] = ~n3 &  n2 &  n1 & ~n0;
+    cnt[7] = ~n3 &  n2 &  n1 &  n0;
+    cnt[8] =  n3 & ~n2 & ~n1 & ~n0;
 
     uint64_t birth = 0, survive = 0;
     for (int n = 0; n <= 8; n++) {
