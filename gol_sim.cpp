@@ -160,14 +160,19 @@ static std::string rules_str(uint8_t B, uint8_t S) {
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct SeedPlacement {
+    std::string name;   // built-in pattern name or file path
+    int cx, cy;         // center on grid (-1,-1 = auto-center)
+    bool is_file;       // true if name is a file path
+};
+
 struct Config {
     int   grid_w          = 1920;
     int   grid_h          = 1080;
     int   threads         = 0;
     uint8_t rule_B        = 8;   // B3
     uint8_t rule_S        = 12;  // S23
-    std::string state_file;
-    std::string seed_pattern;
+    std::vector<SeedPlacement> seeds;
     int   random_seed     = 42;
     float random_density  = 0.3f;
     int   video_w         = 0;
@@ -185,6 +190,7 @@ struct Config {
 
     bool has_video() const { return video_w > 0 && video_h > 0; }
     bool has_archive() const { return !archive_file.empty(); }
+    bool has_seeds() const { return !seeds.empty(); }
 };
 
 static bool parse_config(const std::string& path, Config& cfg) {
@@ -202,8 +208,33 @@ static bool parse_config(const std::string& path, Config& cfg) {
         else if (k=="grid_h")           cfg.grid_h          = atoi(v.c_str());
         else if (k=="threads")          cfg.threads         = atoi(v.c_str());
         else if (k=="rules")            parse_rules(v, cfg.rule_B, cfg.rule_S);
-        else if (k=="state_file")       cfg.state_file      = v;
-        else if (k=="seed_pattern")     cfg.seed_pattern    = v;
+        else if (k=="state_file")       cfg.seeds.push_back({v, -1, -1, true});
+        else if (k=="seed_pattern")     cfg.seeds.push_back({v, -1, -1, false});
+        else if (k=="seed") {
+            std::vector<std::string> tok;
+            char tmp[1024]; strncpy(tmp,v.c_str(),sizeof(tmp)-1);
+            char* t = strtok(tmp," \t");
+            while (t) { tok.push_back(t); t=strtok(nullptr," \t"); }
+            int cx=-1, cy=-1, pos = (int)tok.size();
+            auto is_int = [](const std::string& s) {
+                if (s.empty()) return false;
+                size_t i=0; if (s[i]=='-'||s[i]=='+') i++;
+                return i<s.size() && s.find_first_not_of("0123456789",i)==std::string::npos;
+            };
+            if (pos>=3 && is_int(tok[pos-2]) && is_int(tok[pos-1])) {
+                cx = atoi(tok[pos-2].c_str()); cy = atoi(tok[pos-1].c_str());
+                pos -= 2;
+            } else if (pos>=2 && is_int(tok[pos-1])) {
+                cx = atoi(tok[pos-1].c_str());
+                pos -= 1;
+            }
+            std::string name;
+            for (int i=0;i<pos;i++) { if (i) name+=' '; name+=tok[i]; }
+            bool is_file = name.find('.')!=std::string::npos
+                        || name.find('/')!=std::string::npos
+                        || name.find('\\')!=std::string::npos;
+            cfg.seeds.push_back({name, cx, cy, is_file});
+        }
         else if (k=="random_seed")      cfg.random_seed     = atoi(v.c_str());
         else if (k=="random_density")   cfg.random_density  = (float)atof(v.c_str());
         else if (k=="video_w")          cfg.video_w         = atoi(v.c_str());
@@ -233,10 +264,14 @@ static void write_default_config(const std::string& path) {
         "grid_h          = 1080\n"
         "threads         = 0           # 0 = auto\n\n"
         "rules           = B3/S23\n\n"
-        "# Input: state_file (path to .cells or .gol), seed_pattern (built-in name),\n"
-        "# or neither (random fill).\n"
-        "state_file      =\n"
-        "seed_pattern    =             # glider blinker block r-pentomino acorn pulsar lwss\n"
+        "# Seeds: place one or more patterns on the initial grid.\n"
+        "#   seed = <name_or_file> [cx] [cy]   (cx,cy = center coords; omit = auto-center)\n"
+        "#   seed_pattern = <name>              (backward compat, single; looks in built_in_patterns/)\n"
+        "#   state_file    = <path>              (backward compat, single)\n"
+        "# If no seeds are given, random fill is used.\n"
+        "seed = gosper-gun                      # auto-centered\n"
+        "seed = glider 100 200                  # placed at center (100,200)\n"
+        "seed = block 500 500\n"
         "random_seed     = 42\n"
         "random_density  = 0.3\n\n"
         "# Video output (pipe stdout to ffmpeg)\n"
@@ -267,45 +302,34 @@ static void write_default_config(const std::string& path) {
 
 struct Grid {
     uint64_t* bits;
-    uint8_t*  age;
     int W, H;
     int words_per_row;
 
     Grid(int w, int h) : W(w), H(h) {
         words_per_row = (w + 63) / 64 + 2;
         size_t bsz = (size_t)(h + 2) * words_per_row * sizeof(uint64_t);
-        size_t asz = ((size_t)h * w + 31) & ~(size_t)31;
 #ifdef _WIN32
         bits = (uint64_t*)_aligned_malloc(bsz, 32);
-        age  = (uint8_t*) _aligned_malloc(asz, 32);
 #else
         bits = (uint64_t*)aligned_alloc(32, (bsz + 31) & ~(size_t)31);
-        age  = (uint8_t*) aligned_alloc(32, asz);
 #endif
         memset(bits, 0, bsz);
-        memset(age,  0, asz);
     }
     ~Grid() {
 #ifdef _WIN32
-        _aligned_free(bits); _aligned_free(age);
+        _aligned_free(bits);
 #else
-        free(bits); free(age);
+        free(bits);
 #endif
     }
 
     inline uint64_t* brow(int r)            { return bits + (size_t)(r+1)*words_per_row + 1; }
     inline const uint64_t* brow(int r) const{ return bits + (size_t)(r+1)*words_per_row + 1; }
-    inline uint8_t* arow(int r)             { return age + (size_t)r * W; }
-    inline const uint8_t* arow(int r) const { return age + (size_t)r * W; }
 
     inline int  get(int r, int c) const { return (brow(r)[c/64] >> (c%64)) & 1; }
     inline void set(int r, int c, int v) {
         uint64_t& w = brow(r)[c/64];
         w = (w & ~(1ULL<<(c%64))) | ((uint64_t)v<<(c%64));
-    }
-    inline void set_with_age(int r, int c, int v) {
-        set(r,c,v);
-        arow(r)[c] = v ? 1 : 0;
     }
 };
 
@@ -388,23 +412,6 @@ static StepResult step_rules(Grid& cur, Grid& nxt, uint8_t rule_B, uint8_t rule_
                 bot[w-1],bot[w],bot[w+1],
                 rule_B, rule_S);
             live_total += __builtin_popcountll(out[w]);
-        }
-    }
-
-    #pragma omp parallel for schedule(static)
-    for (int r=0; r<cur.H; r++) {
-        const uint64_t* nbit = nxt.brow(r);
-        const uint8_t*  cage = cur.arow(r);
-        uint8_t*        nage = nxt.arow(r);
-        int W = cur.W;
-        for (int w=0; w<rw; w++) {
-            uint64_t alive = nbit[w];
-            int base=w*64, limit=std::min(64,W-base);
-            if (alive==0ULL) { memset(nage+base,0,limit); continue; }
-            for (int b=0; b<limit; b++) {
-                int cell=base+b;
-                nage[cell] = (alive>>b)&1 ? (cage[cell]>=128 ? 128 : cage[cell]+1) : 0;
-            }
         }
     }
 
@@ -757,7 +764,7 @@ static void random_fill(Grid& g, float density, int seed) {
     for (int r=0; r<g.H; r++)
         for (int c=0; c<g.W; c++) {
             int alive = (rand()/(float)RAND_MAX) < density ? 1 : 0;
-            g.set_with_age(r,c,alive);
+            g.set(r,c,alive);
         }
 }
 
@@ -771,86 +778,30 @@ static long long count_live(const Grid& g) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Named seed patterns (centered on grid)
+// Named seed patterns (loaded from built_in_patterns/*.cells)
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct CellsPattern {
-    std::string name;
-    std::vector<std::string> rows;
-};
+static bool load_cells(Grid& g, const std::string& path, int cx, int cy);
 
-static const CellsPattern BUILT_IN_PATTERNS[] = {
-    {"glider",      {".O.", "..O", "OOO"}},
-    {"blinker",     {"OOO"}},
-    {"block",       {"OO","OO"}},
-    {"r-pentomino", {".OO","OO.",".O."}},
-    {"acorn",       {".O.....","...O...","OO..OOO"}},
-    {"pulsar",      {"..OOO...OOO..",
-                     ".............",
-                     "O....O.O....O",
-                     "O....O.O....O",
-                     "O....O.O....O",
-                     "..OOO...OOO..",
-                     ".............",
-                     "..OOO...OOO..",
-                     "O....O.O....O",
-                     "O....O.O....O",
-                     "O....O.O....O",
-                     ".............",
-                     "..OOO...OOO.."}},
-    {"lwss",        {".O..O","O....","O...O","OOOO."}},
-    {"diehard",     {"......O.","OO......",".O...OOO"}},
-    {"gosper-gun",  {
-        "........................O...........",
-        "......................O.O...........",
-        "............OO......OO............OO",
-        "...........O...O....OO............OO",
-        "OO........O.....O...OO..............",
-        "OO........O...O.OO....O.O...........",
-        "..........O.....O.......O...........",
-        "...........O...O....................",
-        "............OO......................"
-    }},
-};
+static std::string pattern_path(const std::string& name) {
+    return std::string("built_in_patterns/") + name + ".cells";
+}
 
 static bool is_builtin_pattern(const std::string& name) {
-    for (auto& p : BUILT_IN_PATTERNS)
-        if (p.name == name) return true;
+    FILE* f = fopen(pattern_path(name).c_str(), "r");
+    if (f) { fclose(f); return true; }
     return false;
 }
 
-static bool load_named_pattern(Grid& g, const std::string& name) {
-    const CellsPattern* pat = nullptr;
-    for (auto& p : BUILT_IN_PATTERNS)
-        if (p.name == name) { pat = &p; break; }
-    if (!pat) {
-        fprintf(stderr,"Unknown seed pattern '%s'. Available: ", name.c_str());
-        for (auto& p : BUILT_IN_PATTERNS) fprintf(stderr,"%s ", p.name.c_str());
-        fprintf(stderr,"\n");
-        return false;
-    }
-    int ph = (int)pat->rows.size();
-    int pw = 0;
-    for (auto& r : pat->rows) pw = std::max(pw,(int)r.size());
-    int sr = (g.H - ph) / 2, sc = (g.W - pw) / 2;
-    for (int pr=0; pr<ph; pr++) {
-        int gr = sr+pr; if (gr<0||gr>=g.H) continue;
-        for (int pc=0; pc<(int)pat->rows[pr].size(); pc++) {
-            int gc = sc+pc; if (gc<0||gc>=g.W) continue;
-            char ch = pat->rows[pr][pc];
-            if (ch=='O'||ch=='o'||ch=='*') g.set_with_age(gr,gc,1);
-        }
-    }
-    fprintf(stderr,"Loaded pattern '%s' (%dx%d) centered at (%d,%d)\n",
-            name.c_str(),pw,ph,sc,sr);
-    return true;
+static bool load_named_pattern(Grid& g, const std::string& name, int cx=-1, int cy=-1) {
+    return load_cells(g, pattern_path(name), cx, cy);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // .cells / .gol loader
 // ─────────────────────────────────────────────────────────────────────────────
 
-static bool load_cells(Grid& g, const std::string& path) {
+static bool load_cells(Grid& g, const std::string& path, int cx=-1, int cy=-1) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) { fprintf(stderr,"Error: cannot open '%s'\n",path.c_str()); return false; }
     std::vector<std::string> lines;
@@ -864,17 +815,18 @@ static bool load_cells(Grid& g, const std::string& path) {
     fclose(f);
     int pat_h=(int)lines.size(), pat_w=0;
     for (auto& l:lines) pat_w=std::max(pat_w,(int)l.size());
-    int sr=(g.H-pat_h)/2, sc=(g.W-pat_w)/2;
+    int sr=(cx<0)?(g.H-pat_h)/2:cy-pat_h/2;
+    int sc=(cx<0)?(g.W-pat_w)/2:cx-pat_w/2;
     for (int pr=0; pr<pat_h; pr++) {
         int gr=sr+pr; if (gr<0||gr>=g.H) continue;
         for (int pc=0; pc<(int)lines[pr].size(); pc++) {
             int gc=sc+pc; if (gc<0||gc>=g.W) continue;
             char ch=lines[pr][pc];
-            if (ch=='O'||ch=='o'||ch=='*') g.set_with_age(gr,gc,1);
-            else if (ch=='.') g.set_with_age(gr,gc,0);
+            if (ch=='O'||ch=='o'||ch=='*') g.set(gr,gc,1);
+            else if (ch=='.') g.set(gr,gc,0);
         }
     }
-    fprintf(stderr,"Loaded '%s': %dx%d pattern, centered at (%d,%d)\n",
+    fprintf(stderr,"Loaded '%s': %dx%d pattern, placed at (%d,%d)\n",
             path.c_str(),pat_w,pat_h,sc,sr);
     return true;
 }
@@ -945,17 +897,17 @@ static bool load_gol_frame(Grid& g, const std::string& path, int target_gen=0) {
     for (int r=0;r<g.H;r++)
         for (int c=0;c<g.W;c++) {
             int alive=(cur_bits[bit_pos/8]>>(bit_pos%8))&1;
-            g.set_with_age(r,c,alive);
+            g.set(r,c,alive);
             bit_pos++;
         }
     fprintf(stderr,"Loaded gen %d from '%s'\n",target_gen,path.c_str());
     return true;
 }
 
-static bool load_state(Grid& g, const std::string& path) {
+static bool load_state(Grid& g, const std::string& path, int cx=-1, int cy=-1) {
     if (path.size()>4 && path.substr(path.size()-4)==".gol")
         return load_gol_frame(g, path, 0);
-    return load_cells(g, path);
+    return load_cells(g, path, cx, cy);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1108,38 +1060,8 @@ struct GolFrameReader {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Renderer (age -> RGB)
+// Renderer: grid -> RGB24 (alive=white, dead=black)
 // ─────────────────────────────────────────────────────────────────────────────
-
-struct RGB { uint8_t r,g,b; };
-static RGB age_lut[129];
-
-static void build_age_lut() {
-    struct Stop { float t; uint8_t r,g,b; };
-    static const Stop stops[] = {
-        {0.00f, 255,255,255},
-        {0.15f, 255,255,  0},
-        {0.38f, 255,140,  0},
-        {0.60f,   0,200, 60},
-        {0.78f,   0, 80,255},
-        {1.00f,   0, 20, 80},
-    };
-    age_lut[0]={0,0,0};
-    for (int age=1; age<=128; age++) {
-        float t=(age-1)/127.0f;
-        RGB c={255,255,255};
-        for (int i=1; i<6; i++) {
-            if (t<=stops[i].t) {
-                float s=(t-stops[i-1].t)/(stops[i].t-stops[i-1].t);
-                c.r=(uint8_t)(stops[i-1].r+s*(stops[i].r-stops[i-1].r));
-                c.g=(uint8_t)(stops[i-1].g+s*(stops[i].g-stops[i-1].g));
-                c.b=(uint8_t)(stops[i-1].b+s*(stops[i].b-stops[i-1].b));
-                break;
-            }
-        }
-        age_lut[age]=c;
-    }
-}
 
 static void render_frame(const Grid& g, int rW, int rH, std::vector<uint8_t>& buf) {
     buf.resize((size_t)rW*rH*3);
@@ -1151,14 +1073,13 @@ static void render_frame(const Grid& g, int rW, int rH, std::vector<uint8_t>& bu
         for (int px=0; px<rW; px++) {
             int gc0=(int)((double)px*g.W/rW), gc1=(int)((double)(px+1)*g.W/rW);
             if (gc1<=gc0) gc1=gc0+1; if (gc1>g.W) gc1=g.W;
-            uint8_t max_age=0;
-            for (int gr=gr0; gr<gr1&&max_age<128; gr++) {
-                const uint8_t* ar=g.arow(gr);
-                for (int gc=gc0; gc<gc1; gc++)
-                    if (ar[gc]>max_age) max_age=ar[gc];
+            int alive=0;
+            for (int gr=gr0; gr<gr1&&!alive; gr++) {
+                const uint64_t* row=g.brow(gr);
+                for (int gc=gc0; gc<gc1&&!alive; gc++)
+                    if ((row[gc/64]>>(gc%64))&1) alive=1;
             }
-            RGB c=age_lut[max_age];
-            out_row[px*3]=c.r; out_row[px*3+1]=c.g; out_row[px*3+2]=c.b;
+            out_row[px*3]=alive*255; out_row[px*3+1]=alive*255; out_row[px*3+2]=alive*255;
         }
     }
 }
@@ -1175,9 +1096,9 @@ static void run_bench(int W, int H, int GENS, int THREADS, const std::string& pa
     else                  random_fill(A,0.3f,42);
     sync_borders(A);
     fprintf(stderr,"Warmup...\n");
-    for (int i=0;i<10;i++){step_rules(A,B,8,12);sync_borders(B);std::swap(A.bits,B.bits);std::swap(A.age,B.age);}
+    for (int i=0;i<10;i++){step_rules(A,B,8,12);sync_borders(B);std::swap(A.bits,B.bits);}
     auto t0=std::chrono::high_resolution_clock::now();
-    for (int i=0;i<GENS;i++){step_rules(A,B,8,12);sync_borders(B);std::swap(A.bits,B.bits);std::swap(A.age,B.age);}
+    for (int i=0;i<GENS;i++){step_rules(A,B,8,12);sync_borders(B);std::swap(A.bits,B.bits);}
     double el=std::chrono::duration<double>(std::chrono::high_resolution_clock::now()-t0).count();
     fprintf(stderr,"Time: %.3fs  GPS: %.1f  GCUPS: %.3f\n",el,GENS/el,(double)W*H*GENS/el/1e9);
 }
@@ -1192,7 +1113,6 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
                       uint8_t rule_B, uint8_t rule_S, int seed, float density)
 {
     omp_set_num_threads(THREADS);
-    build_age_lut();
     SET_STDOUT_BINARY();
 
     fprintf(stderr,"=== GoL Video Export ===\n");
@@ -1203,11 +1123,11 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 
     Grid A(W,H),B(W,H);
     if (!state_file.empty()) {
-        if (!load_state(A,state_file)) return;
+        if (!load_state(A, state_file)) return;
     } else if (!seed_pattern.empty()) {
         if (!load_named_pattern(A, seed_pattern)) return;
     } else {
-        random_fill(A,density,seed);
+        random_fill(A, density, seed);
     }
     sync_borders(A);
 
@@ -1222,7 +1142,7 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 
         step_rules(A,B,rule_B,rule_S);
         sync_borders(B);
-        std::swap(A.bits,B.bits); std::swap(A.age,B.age);
+        std::swap(A.bits,B.bits);
 
         if (gen%50==0||gen==GENS-1) {
             auto now=std::chrono::high_resolution_clock::now();
@@ -1242,7 +1162,6 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 
 static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int THREADS) {
     omp_set_num_threads(THREADS);
-    build_age_lut();
     SET_STDOUT_BINARY();
 
     // Get header info for progress reporting
@@ -1302,20 +1221,42 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
         }
     }
 
-    // Render gen 0
-    {
-        Grid temp(grid_w, grid_h);
-        long long bp = 0;
-        for (int r = 0; r < grid_h; r++)
-            for (int c = 0; c < grid_w; c++) {
-                int alive = (bits[bp/8] >> (bp%8)) & 1;
-                if (alive) {
-                    temp.set(r, c, 1);
-                    temp.arow(r)[c] = ages[r * (size_t)grid_w + c];
+    // Build age color LUT for render-from-archive (white->yellow->orange->green->blue)
+    uint8_t age_lut_r[129], age_lut_g[129], age_lut_b[129];
+    age_lut_r[0]=age_lut_g[0]=age_lut_b[0]=0;
+    for (int a=1; a<=128; a++) {
+        float t=(a-1)/127.0f;
+        if (t<0.15f)      { float s=t/0.15f; age_lut_r[a]=255;           age_lut_g[a]=255;           age_lut_b[a]=(uint8_t)(255*(1-s)); }
+        else if (t<0.38f) { float s=(t-0.15f)/0.23f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(255*(1-s*0.45f)); age_lut_b[a]=0; }
+        else if (t<0.60f) { float s=(t-0.38f)/0.22f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(140+60*(1-s)); age_lut_b[a]=0; }
+        else if (t<0.78f) { float s=(t-0.60f)/0.18f; age_lut_r[a]=(uint8_t)(255-255*s); age_lut_g[a]=200; age_lut_b[a]=(uint8_t)(60+195*s); }
+        else              { float s=(t-0.78f)/0.22f; age_lut_r[a]=0;    age_lut_g[a]=(uint8_t)(80-60*s); age_lut_b[a]=(uint8_t)(255-175*s); }
+    }
+
+    // Helper: render row range with age coloring
+    auto render_row = [&](int py, const uint8_t* bits, const uint8_t* ages, uint8_t* out) {
+        int gr0=(int)((double)py*grid_h/rH), gr1=(int)((double)(py+1)*grid_h/rH);
+        if (gr1<=gr0) gr1=gr0+1; if (gr1>grid_h) gr1=grid_h;
+        for (int px=0; px<rW; px++) {
+            int gc0=(int)((double)px*grid_w/rW), gc1=(int)((double)(px+1)*grid_w/rW);
+            if (gc1<=gc0) gc1=gc0+1; if (gc1>grid_w) gc1=grid_w;
+            uint8_t max_age=0;
+            for (int gr=gr0; gr<gr1&&max_age<128; gr++) {
+                for (int gc=gc0; gc<gc1; gc++) {
+                    size_t idx = (size_t)gr*grid_w+gc;
+                    uint8_t a = ages[idx];
+                    if (a>max_age) max_age=a;
                 }
-                bp++;
             }
-        render_frame(temp, rW, rH, frame_buf);
+            out[px*3]=age_lut_r[max_age]; out[px*3+1]=age_lut_g[max_age]; out[px*3+2]=age_lut_b[max_age];
+        }
+    };
+
+    // Render gen 0
+    if (rW>0 && rH>0) {
+        frame_buf.resize(frame_bytes);
+        for (int py=0; py<rH; py++)
+            render_row(py, bits.data(), ages, frame_buf.data()+py*rW*3);
         fwrite(frame_buf.data(), 1, frame_bytes, stdout);
     }
 
@@ -1336,19 +1277,11 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
         }
 
         // Render using live bits + ages
-        Grid temp(grid_w, grid_h);
-        bp = 0;
-        for (int r = 0; r < grid_h; r++)
-            for (int c = 0; c < grid_w; c++) {
-                int alive = (bits[bp/8] >> (bp%8)) & 1;
-                if (alive) {
-                    temp.set(r, c, 1);
-                    temp.arow(r)[c] = ages[r * (size_t)grid_w + c];
-                }
-                bp++;
-            }
-        render_frame(temp, rW, rH, frame_buf);
-        fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+        if (rW>0 && rH>0) {
+            for (int py=0; py<rH; py++)
+                render_row(py, bits.data(), ages, frame_buf.data()+py*rW*3);
+            fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+        }
 
         if (gen % 100 == 0 || gen % 1000 == 0 || gen == 1) fflush(stdout);
 
@@ -1372,7 +1305,6 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
 
 static int run_sim(const Config& cfg) {
     omp_set_num_threads(cfg.threads);
-    build_age_lut();
 
     if (cfg.has_video()) SET_STDOUT_BINARY();
 
@@ -1394,10 +1326,13 @@ static int run_sim(const Config& cfg) {
 
     Grid A(cfg.grid_w,cfg.grid_h), B(cfg.grid_w,cfg.grid_h);
 
-    if (!cfg.state_file.empty()) {
-        if (!load_state(A, cfg.state_file)) return 1;
-    } else if (!cfg.seed_pattern.empty()) {
-        if (!load_named_pattern(A, cfg.seed_pattern)) return 1;
+    if (cfg.has_seeds()) {
+        for (auto& seed : cfg.seeds) {
+            bool ok;
+            if (seed.is_file) ok = load_state(A, seed.name, seed.cx, seed.cy);
+            else ok = load_named_pattern(A, seed.name, seed.cx, seed.cy);
+            if (!ok) return 1;
+        }
     } else {
         random_fill(A, cfg.random_density, cfg.random_seed);
     }
@@ -1431,7 +1366,7 @@ static int run_sim(const Config& cfg) {
     for (int gen=1; gen<=cfg.max_gens; gen++) {
         StepResult res = step_rules(A,B,cfg.rule_B,cfg.rule_S);
         sync_borders(B);
-        std::swap(A.bits,B.bits); std::swap(A.age,B.age);
+        std::swap(A.bits,B.bits);
 
         if (cfg.has_archive() && gen % cfg.archive_every == 0)
             archive.write_frame(gen, res.live_count, A);
@@ -1518,7 +1453,7 @@ static void usage(const char* p) {
         "  %s extract <file.gol> <gen> <out.cells>\n"
         "  %s render  <file.gol> <rW> <rH> <fps> [threads]\n\n"
         "Pattern names (use directly in place of state file):\n"
-        "  glider blinker block r-pentomino acorn pulsar lwss diehard gosper-gun\n\n"
+        "  any *.cells file in built_in_patterns/\n\n"
         "Examples:\n"
         "  ./gol video 3840 2160 600 60 1920 1080 8 gosper-gun\n"
         "  ./gol video 1920 1080 500 60 1920 1080 8 glider B3/S23\n"
