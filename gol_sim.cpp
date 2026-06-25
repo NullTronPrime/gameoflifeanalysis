@@ -118,6 +118,7 @@
 #include <unordered_map>
 #include <cassert>
 #include <omp.h>
+#include <zstd.h>
 
 #ifdef _WIN32
   #include <io.h>
@@ -180,6 +181,7 @@ struct Config {
     int   cycle_window    = 1024;
     std::string archive_file;
     int   archive_every   = 1;
+    std::string final_cells_file;
 
     bool has_video() const { return video_w > 0 && video_h > 0; }
     bool has_archive() const { return !archive_file.empty(); }
@@ -215,6 +217,7 @@ static bool parse_config(const std::string& path, Config& cfg) {
         else if (k=="cycle_window")     cfg.cycle_window    = atoi(v.c_str());
         else if (k=="archive_file")     cfg.archive_file    = v;
         else if (k=="archive_every")    cfg.archive_every   = atoi(v.c_str());
+        else if (k=="final_cells_file") cfg.final_cells_file = v;
     }
     fclose(f);
     if (cfg.threads <= 0) cfg.threads = omp_get_max_threads();
@@ -249,7 +252,10 @@ static void write_default_config(const std::string& path) {
         "cycle_window    = 1024        # max detectable period\n\n"
         "# Archive: lossless binary record of every generation\n"
         "archive_file    =             # e.g. run.gol\n"
-        "archive_every   = 1          # 1 = every gen, 10 = every 10th, etc.\n"
+        "archive_every   = 1          # 1 = every gen, 10 = every 10th, etc.\n\n"
+        "# Optional: dump the final (stagnated) state as a .cells file for a\n"
+        "# quick look in Golly / LifeViewer. Trims to the live-cell bounding box.\n"
+        "final_cells_file =            # e.g. final_state.cells\n"
     );
     fclose(f);
     fprintf(stderr, "Wrote default config: %s\n", path.c_str());
@@ -459,7 +465,10 @@ struct StagnationDetector {
             }
             history.push_back({gen, h});
             hash_map[h] = gen;
-            if ((int)history.size() > window) {
+            // window <= 0 means unbounded: keep every hash for the whole
+            // run. Memory cost is trivial (~24 bytes/gen) compared to the
+            // value of not silently missing long-period cycles.
+            if (window > 0 && (int)history.size() > window) {
                 auto& front = history.front();
                 hash_map.erase(front.second);
                 history.pop_front();
@@ -469,6 +478,90 @@ struct StagnationDetector {
         return {false};
     }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compression helpers (.gol archive)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum { GOL_COMPRESS_RAW = 0, GOL_COMPRESS_DELTA = 1 };
+enum { GOL_BLOCK_LOG2 = 7, GOL_BLOCK_SIZE = 1 << GOL_BLOCK_LOG2 }; // 128 bytes
+
+// Block-sparse encode: split `data` (nbytes) into blocks, write bitmask + kept blocks.
+// Returns compressed data (caller free). Sets *out_size.
+static uint8_t* block_sparse_encode(const uint8_t* data, size_t nbytes, size_t* out_size) {
+    size_t nblocks = (nbytes + GOL_BLOCK_SIZE - 1) / GOL_BLOCK_SIZE;
+    size_t mask_bytes = (nblocks + 7) / 8;
+    std::vector<uint8_t> mask(mask_bytes, 0);
+    std::vector<uint8_t> blocks;
+    blocks.reserve(nbytes); // worst case
+
+    for (size_t i = 0; i < nblocks; i++) {
+        size_t off = i * GOL_BLOCK_SIZE;
+        size_t remain = nbytes - off;
+        size_t blen = (remain < GOL_BLOCK_SIZE) ? remain : GOL_BLOCK_SIZE;
+        bool all_zero = true;
+        for (size_t j = 0; j < blen; j++) {
+            if (data[off + j]) { all_zero = false; break; }
+        }
+        if (!all_zero) {
+            mask[i / 8] |= (uint8_t)(1 << (i % 8));
+            blocks.insert(blocks.end(), data + off, data + off + blen);
+        }
+    }
+
+    *out_size = mask_bytes + blocks.size();
+    uint8_t* result = (uint8_t*)malloc(*out_size);
+    if (!result) return nullptr;
+    memcpy(result, mask.data(), mask_bytes);
+    if (!blocks.empty()) memcpy(result + mask_bytes, blocks.data(), blocks.size());
+    return result;
+}
+
+// Block-sparse decode: inverse of above.
+static uint8_t* block_sparse_decode(const uint8_t* compressed, size_t csize, size_t nbytes, size_t* out_size) {
+    size_t nblocks = (nbytes + GOL_BLOCK_SIZE - 1) / GOL_BLOCK_SIZE;
+    size_t mask_bytes = (nblocks + 7) / 8;
+    if (csize < mask_bytes) return nullptr;
+
+    uint8_t* result = (uint8_t*)calloc(1, nbytes);
+    if (!result) return nullptr;
+    *out_size = nbytes;
+
+    const uint8_t* mask = compressed;
+    const uint8_t* blocks = compressed + mask_bytes;
+    size_t block_pos = 0;
+
+    for (size_t i = 0; i < nblocks; i++) {
+        size_t off = i * GOL_BLOCK_SIZE;
+        size_t blen = ((off + GOL_BLOCK_SIZE) <= nbytes) ? GOL_BLOCK_SIZE : (nbytes - off);
+        if (mask[i / 8] & (1 << (i % 8))) {
+            memcpy(result + off, blocks + block_pos, blen);
+            block_pos += blen;
+        }
+    }
+    return result;
+}
+
+// Zstd wrapper: compress src (size) → *dst, *dst_size allocated by malloc.
+static bool zstd_compress(const uint8_t* src, size_t size, uint8_t** dst, size_t* dst_size, int level) {
+    size_t bound = ZSTD_compressBound(size);
+    *dst = (uint8_t*)malloc(bound);
+    if (!*dst) return false;
+    *dst_size = ZSTD_compress(*dst, bound, src, size, level);
+    if (ZSTD_isError(*dst_size)) { free(*dst); *dst = nullptr; return false; }
+    // Shrink allocation
+    uint8_t* shrunk = (uint8_t*)realloc(*dst, *dst_size);
+    if (shrunk) *dst = shrunk;
+    return true;
+}
+
+static bool zstd_decompress(const uint8_t* src, size_t src_size, uint8_t** dst, size_t dst_size) {
+    *dst = (uint8_t*)malloc(dst_size);
+    if (!*dst) return false;
+    size_t res = ZSTD_decompress(*dst, dst_size, src, src_size);
+    if (ZSTD_isError(res) || res != dst_size) { free(*dst); *dst = nullptr; return false; }
+    return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // .gol Archive writer
@@ -482,16 +575,23 @@ struct GolArchive {
     uint8_t  rule_B   = 8;
     uint8_t  rule_S   = 12;
     uint32_t fps_hint = 0;
-    size_t   bytes_per_frame = 0;
+    uint8_t  compression = GOL_COMPRESS_DELTA;
+    int      zstd_level  = 19;
+    size_t   nbytes      = 0;
+    uint8_t* prev_bits   = nullptr;
 
     static const size_t HEADER_SIZE = 64;
 
     bool open(const std::string& path, int W, int H,
-              uint8_t B, uint8_t S, uint32_t fps=0) {
+              uint8_t B, uint8_t S, uint32_t fps=0,
+              uint8_t comp=GOL_COMPRESS_DELTA, int zl=19) {
         fp = fopen(path.c_str(), "wb");
         if (!fp) { fprintf(stderr,"Archive: cannot open '%s'\n",path.c_str()); return false; }
         grid_w=W; grid_h=H; rule_B=B; rule_S=S; fps_hint=fps;
-        bytes_per_frame = 12 + (size_t)((W*H+7)/8);
+        compression=comp; zstd_level=zl;
+        nbytes = (size_t)((size_t)W*H+7)/8;
+        prev_bits = (uint8_t*)calloc(1, nbytes);
+        if (!prev_bits) { fclose(fp); fp=nullptr; return false; }
         uint8_t hdr[HEADER_SIZE] = {};
         hdr[0]='G'; hdr[1]='O'; hdr[2]='L'; hdr[3]='1';
         write_u32(hdr+4,  W);
@@ -501,28 +601,83 @@ struct GolArchive {
         hdr[20]=B; hdr[24]=S;
         write_i32(hdr+28, -1);
         write_i32(hdr+32, -1);
+        hdr[36] = compression;
+        hdr[37] = (uint8_t)zstd_level;
         fwrite(hdr, 1, HEADER_SIZE, fp);
         return true;
     }
 
     void write_frame(int gen, long long live_count, const Grid& g) {
         if (!fp) return;
-        uint8_t fhdr[12];
-        write_u64(fhdr+0, (uint64_t)gen);
-        write_u32(fhdr+8, (uint32_t)live_count);
-        fwrite(fhdr, 1, 12, fp);
-        size_t nbytes = (size_t)((g.W*g.H+7)/8);
-        std::vector<uint8_t> buf(nbytes, 0);
+        // Pack grid bits into byte array
+        std::vector<uint8_t> cur(nbytes, 0);
         long long bit_pos = 0;
         for (int r=0; r<g.H; r++) {
             const uint64_t* row = g.brow(r);
             for (int c=0; c<g.W; c++) {
-                int alive = (row[c/64] >> (c%64)) & 1;
-                if (alive) buf[bit_pos/8] |= (1 << (bit_pos%8));
+                if ((row[c/64] >> (c%64)) & 1) cur[bit_pos/8] |= (1 << (bit_pos%8));
                 bit_pos++;
             }
         }
-        fwrite(buf.data(), 1, nbytes, fp);
+
+        if (compression == GOL_COMPRESS_DELTA && gen > 0) {
+            // Delta encode: XOR with previous frame
+            std::vector<uint8_t> delta(nbytes);
+            for (size_t i = 0; i < nbytes; i++) delta[i] = cur[i] ^ prev_bits[i];
+
+            // Block-sparse encode the delta
+            size_t sparse_size = 0;
+            uint8_t* sparse = block_sparse_encode(delta.data(), nbytes, &sparse_size);
+            if (!sparse) { /* fall through to raw */ goto write_raw; }
+
+            // zstd compress the sparse data
+            size_t csize = 0;
+            uint8_t* cdata = nullptr;
+            if (!zstd_compress(sparse, sparse_size, &cdata, &csize, zstd_level)) {
+                free(sparse); goto write_raw;
+            }
+
+            // Write compressed frame header: 8+4+1+4+4 + csize
+            uint8_t fhdr[21];
+            write_u64(fhdr+0, (uint64_t)gen);
+            write_u32(fhdr+8, (uint32_t)live_count);
+            fhdr[12] = GOL_COMPRESS_DELTA;
+            write_u32(fhdr+13, (uint32_t)sparse_size);
+            write_u32(fhdr+17, (uint32_t)csize);
+            fwrite(fhdr, 1, 21, fp);
+            fwrite(cdata, 1, csize, fp);
+            free(sparse); free(cdata);
+        } else {
+            // Frame 0 or raw mode: block-sparse + zstd
+            write_raw: {
+                size_t sparse_size = 0;
+                uint8_t* sparse = block_sparse_encode(cur.data(), nbytes, &sparse_size);
+                size_t csize = 0;
+                uint8_t* cdata = nullptr;
+                if (sparse && zstd_compress(sparse, sparse_size, &cdata, &csize, zstd_level)) {
+                    uint8_t fhdr[21];
+                    write_u64(fhdr+0, (uint64_t)gen);
+                    write_u32(fhdr+8, (uint32_t)live_count);
+                    fhdr[12] = GOL_COMPRESS_DELTA;
+                    write_u32(fhdr+13, (uint32_t)sparse_size);
+                    write_u32(fhdr+17, (uint32_t)csize);
+                    fwrite(fhdr, 1, 21, fp);
+                    fwrite(cdata, 1, csize, fp);
+                    free(sparse); free(cdata);
+                } else {
+                    free(sparse);
+                    // Fallback: raw uncompressed frame
+                    uint8_t fhdr[12];
+                    write_u64(fhdr+0, (uint64_t)gen);
+                    write_u32(fhdr+8, (uint32_t)live_count);
+                    fwrite(fhdr, 1, 12, fp);
+                    fwrite(cur.data(), 1, nbytes, fp);
+                }
+            }
+        }
+
+        // Save as previous for next delta
+        memcpy(prev_bits, cur.data(), nbytes);
         gen_count++;
     }
 
@@ -533,11 +688,11 @@ struct GolArchive {
         write_u32(tmp, gen_count);  fwrite(tmp, 1, 4, fp);
         fseek(fp, 28, SEEK_SET);
         write_i32(tmp, stag_period); fwrite(tmp, 1, 4, fp);
-        write_i32(tmp, stag_gen);    fwrite(tmp, 1, 4, fp);
         fclose(fp); fp=nullptr;
+        free(prev_bits); prev_bits=nullptr;
     }
 
-    ~GolArchive() { if (fp) close(); }
+    ~GolArchive() { if (fp) close(); else free(prev_bits); }
 
     static void write_u32(uint8_t* p, uint32_t v) {
         p[0]=v&0xff; p[1]=(v>>8)&0xff; p[2]=(v>>16)&0xff; p[3]=(v>>24)&0xff;
@@ -569,6 +724,9 @@ static void archive_info(const std::string& path) {
     int32_t  sp   = ri32(hdr+28);
     int32_t  sg   = ri32(hdr+32);
 
+    uint8_t comp    = hdr[36];
+    int     zl      = hdr[37];
+
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fclose(f);
@@ -577,16 +735,17 @@ static void archive_info(const std::string& path) {
     fprintf(stderr,"File:        %s  (%.2f MB)\n", path.c_str(), fsize/1048576.0);
     fprintf(stderr,"Grid:        %dx%d\n", W, H);
     fprintf(stderr,"Rules:       %s\n", rules_str(B,S).c_str());
+    fprintf(stderr,"Compression: %s (zstd level %d)\n",
+            comp==0?"none":"delta+blocksparse+zstd", zl);
     fprintf(stderr,"Generations: %u\n", gens);
     if (fps>0) fprintf(stderr,"FPS hint:    %u\n", fps);
     if (sp==-1)       fprintf(stderr,"Stagnation:  extinction\n");
     else if (sp==0)   fprintf(stderr,"Stagnation:  max_gens reached (none detected)\n");
     else              fprintf(stderr,"Stagnation:  period %d cycle, detected at gen %d\n", sp, sg);
-    size_t bytes_per = 12 + (size_t)((W*H+7)/8);
-    fprintf(stderr,"Frame size:  %zu bytes (header 12 + %zu bits payload)\n",
-            bytes_per, (size_t)W*H);
-    if (gens>0) fprintf(stderr,"Ratio:       %.2f bytes/cell/gen\n",
-            (double)bytes_per/(W*H));
+    size_t raw_per = 12 + (size_t)((W*H+7)/8);
+    double ratio = (double)raw_per * gens / fsize;
+    fprintf(stderr,"Raw frame:   %zu bytes  |  Compressed: %.2f MB total  |  Ratio: %.1fx\n",
+            raw_per, fsize/1048576.0, ratio);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -733,22 +892,59 @@ static bool load_gol_frame(Grid& g, const std::string& path, int target_gen=0) {
         fprintf(stderr,".gol grid %dx%d doesn't match target %dx%d\n",W,H,g.W,g.H);
         fclose(f); return false;
     }
+    uint8_t compression = hdr[36];
     size_t nbytes=(size_t)((W*H+7)/8);
-    uint8_t fhdr[12];
-    for (int gen=0;;gen++) {
-        if (fread(fhdr,1,12,f)!=12) {
-            fprintf(stderr,".gol: gen %d not found\n",target_gen); fclose(f); return false;
+    std::vector<uint8_t> prev_bits(nbytes, 0);
+    std::vector<uint8_t> cur_bits(nbytes, 0);
+
+    for (int gen=0; gen<=target_gen; gen++) {
+        if (compression == GOL_COMPRESS_DELTA) {
+            uint8_t fhdr[21];
+            size_t got = fread(fhdr,1,21,f);
+            if (got<21) { fprintf(stderr,".gol: frame %d truncated\n",gen); fclose(f); return false; }
+            uint8_t  ctype  = fhdr[12];
+            (void)ctype;
+            uint32_t usize  = (uint32_t)fhdr[13]|((uint32_t)fhdr[14]<<8)|((uint32_t)fhdr[15]<<16)|((uint32_t)fhdr[16]<<24);
+            uint32_t csize  = (uint32_t)fhdr[17]|((uint32_t)fhdr[18]<<8)|((uint32_t)fhdr[19]<<16)|((uint32_t)fhdr[20]<<24);
+            std::vector<uint8_t> cdata(csize);
+            if (fread(cdata.data(),1,csize,f)!=csize) {
+                fprintf(stderr,".gol: frame %d data truncated\n",gen); fclose(f); return false;
+            }
+            uint8_t* sparse = nullptr;
+            if (!zstd_decompress(cdata.data(),csize,&sparse,usize)) {
+                fprintf(stderr,".gol: frame %d decompress failed\n",gen); fclose(f); return false;
+            }
+            size_t decoded_nbytes=0;
+            uint8_t* decoded = block_sparse_decode(sparse,usize,nbytes,&decoded_nbytes);
+            free(sparse);
+            if (!decoded) { fprintf(stderr,".gol: frame %d block decode failed\n",gen); fclose(f); return false; }
+            if (gen==0) {
+                memcpy(cur_bits.data(),decoded,nbytes);
+            } else {
+                for (size_t i=0;i<nbytes;i++) cur_bits[i] = decoded[i] ^ prev_bits[i];
+            }
+            if (gen<target_gen) memcpy(prev_bits.data(),cur_bits.data(),nbytes);
+            free(decoded);
+        } else {
+            uint8_t fhdr[12];
+            if (fread(fhdr,1,12,f)!=12) {
+                fprintf(stderr,".gol: gen %d not found\n",target_gen); fclose(f); return false;
+            }
+            if (gen==target_gen) {
+                if (fread(cur_bits.data(),1,nbytes,f)!=(size_t)nbytes) {
+                    fprintf(stderr,".gol: frame %d data truncated\n",gen); fclose(f); return false;
+                }
+            } else {
+                fseek(f,(long)nbytes,SEEK_CUR);
+            }
         }
-        if (gen==target_gen) break;
-        fseek(f,(long)nbytes,SEEK_CUR);
     }
-    std::vector<uint8_t> buf(nbytes);
-    fread(buf.data(),1,nbytes,f);
     fclose(f);
+
     long long bit_pos=0;
     for (int r=0;r<g.H;r++)
         for (int c=0;c<g.W;c++) {
-            int alive=(buf[bit_pos/8]>>(bit_pos%8))&1;
+            int alive=(cur_bits[bit_pos/8]>>(bit_pos%8))&1;
             g.set_with_age(r,c,alive);
             bit_pos++;
         }
@@ -761,6 +957,155 @@ static bool load_state(Grid& g, const std::string& path) {
         return load_gol_frame(g, path, 0);
     return load_cells(g, path);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// .cells writer — trims to the minimal bounding box of live cells (Golly
+// plaintext convention) so the exported pattern can be re-loaded by load_cells,
+// opened in Golly/LifeViewer, or diffed against a known pattern signature.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool write_cells(const Grid& g, const std::string& path,
+                         const std::string& comment = "") {
+    int min_r=g.H, max_r=-1, min_c=g.W, max_c=-1;
+    for (int r=0; r<g.H; r++) {
+        const uint64_t* row = g.brow(r);
+        for (int c=0; c<g.W; c++) {
+            if ((row[c/64]>>(c%64))&1) {
+                if (r<min_r) min_r=r;
+                if (r>max_r) max_r=r;
+                if (c<min_c) min_c=c;
+                if (c>max_c) max_c=c;
+            }
+        }
+    }
+
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) { fprintf(stderr,"Error: cannot write '%s'\n",path.c_str()); return false; }
+    if (!comment.empty()) fprintf(f, "!%s\n", comment.c_str());
+
+    if (max_r < 0) {
+        fprintf(f, "!Extinct: 0 live cells\n");
+        fclose(f);
+        fprintf(stderr,"Wrote '%s': extinct (no live cells)\n",path.c_str());
+        return true;
+    }
+
+    int bw = max_c-min_c+1, bh = max_r-min_r+1;
+    for (int r=min_r; r<=max_r; r++) {
+        const uint64_t* row = g.brow(r);
+        std::string line(bw, '.');
+        for (int c=min_c; c<=max_c; c++)
+            if ((row[c/64]>>(c%64))&1) line[c-min_c]='O';
+        fprintf(f, "%s\n", line.c_str());
+    }
+    fclose(f);
+    fprintf(stderr,"Wrote '%s': %dx%d bounding box at (%d,%d)\n",
+            path.c_str(),bw,bh,min_c,min_r);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// extract mode: pull a single generation out of a .gol archive as .cells
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool run_extract(const std::string& gol_path, int target_gen, const std::string& out_path) {
+    FILE* f = fopen(gol_path.c_str(), "rb");
+    if (!f) { fprintf(stderr,"Cannot open '%s'\n",gol_path.c_str()); return false; }
+    uint8_t hdr[64];
+    if (fread(hdr,1,64,f)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+        fprintf(stderr,"Not a valid .gol file\n"); fclose(f); return false;
+    }
+    auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+    uint32_t W=ru32(hdr+4), H=ru32(hdr+8), gens=ru32(hdr+12);
+    fclose(f);
+
+    if (target_gen < 0 || (gens > 0 && (uint32_t)target_gen >= gens)) {
+        fprintf(stderr,"Warning: gen %d may be outside recorded range [0,%u)\n",target_gen,gens);
+    }
+
+    Grid g((int)W,(int)H);
+    if (!load_gol_frame(g, gol_path, target_gen)) return false;
+
+    char namebuf[320];
+    snprintf(namebuf,sizeof(namebuf),"Extracted from %s, gen %d",gol_path.c_str(),target_gen);
+    return write_cells(g, out_path, namebuf);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Streaming .gol frame reader (sequential only, for render-from-archive)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct GolFrameReader {
+    FILE*    fp       = nullptr;
+    uint8_t  compression = 0;
+    size_t   nbytes      = 0;
+    uint8_t* prev_bits   = nullptr;
+    int      cur_gen     = -1;
+
+    bool open(const std::string& path) {
+        fp = fopen(path.c_str(), "rb");
+        if (!fp) { fprintf(stderr, "Cannot open '%s'\n", path.c_str()); return false; }
+        uint8_t hdr[64];
+        if (fread(hdr, 1, 64, fp) != 64 || hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+            fprintf(stderr, "Not a valid .gol file\n"); fclose(fp); fp=nullptr; return false;
+        }
+        auto ru32 = [](uint8_t* p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); };
+        uint32_t W = ru32(hdr+4), H = ru32(hdr+8);
+        nbytes = (size_t)((size_t)W*H+7)/8;
+        compression = hdr[36];
+        prev_bits = (uint8_t*)calloc(1, nbytes);
+        if (!prev_bits) { fclose(fp); fp=nullptr; return false; }
+        cur_gen = 0;
+        return true;
+    }
+
+    // Read next frame. Returns false at end of file.
+    // Sets *live_count and fills `bits_out` with nbytes of bit-packed row-major data.
+    bool read_next(uint32_t& live_count, std::vector<uint8_t>& bits_out) {
+        if (!fp) return false;
+        bits_out.resize(nbytes);
+
+        if (compression == GOL_COMPRESS_DELTA) {
+            uint8_t fhdr[21];
+            if (fread(fhdr, 1, 21, fp) != 21) return false;
+            live_count = (uint32_t)fhdr[8]|((uint32_t)fhdr[9]<<8)|((uint32_t)fhdr[10]<<16)|((uint32_t)fhdr[11]<<24);
+            uint8_t  ctype  = fhdr[12]; (void)ctype;
+            uint32_t usize  = (uint32_t)fhdr[13]|((uint32_t)fhdr[14]<<8)|((uint32_t)fhdr[15]<<16)|((uint32_t)fhdr[16]<<24);
+            uint32_t csize  = (uint32_t)fhdr[17]|((uint32_t)fhdr[18]<<8)|((uint32_t)fhdr[19]<<16)|((uint32_t)fhdr[20]<<24);
+            std::vector<uint8_t> cdata(csize);
+            if (fread(cdata.data(), 1, csize, fp) != csize) return false;
+
+            uint8_t* sparse = nullptr;
+            if (!zstd_decompress(cdata.data(), csize, &sparse, usize)) return false;
+            size_t decoded_nbytes = 0;
+            uint8_t* decoded = block_sparse_decode(sparse, usize, nbytes, &decoded_nbytes);
+            free(sparse);
+            if (!decoded) return false;
+
+            if (cur_gen == 0) {
+                memcpy(bits_out.data(), decoded, nbytes);
+                memcpy(prev_bits, decoded, nbytes);
+            } else {
+                for (size_t i = 0; i < nbytes; i++) {
+                    uint8_t v = decoded[i] ^ prev_bits[i];
+                    prev_bits[i] = v;
+                    bits_out[i] = v;
+                }
+            }
+            free(decoded);
+        } else {
+            uint8_t fhdr[12];
+            if (fread(fhdr, 1, 12, fp) != 12) return false;
+            live_count = (uint32_t)fhdr[8]|((uint32_t)fhdr[9]<<8)|((uint32_t)fhdr[10]<<16)|((uint32_t)fhdr[11]<<24);
+            if (fread(bits_out.data(), 1, nbytes, fp) != nbytes) return false;
+        }
+        cur_gen++;
+        return true;
+    }
+
+    void close() { if (fp) { fclose(fp); fp=nullptr; } free(prev_bits); prev_bits=nullptr; }
+    ~GolFrameReader() { close(); }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Renderer (age -> RGB)
@@ -892,6 +1237,136 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Render mode — render .gol archive to RGB24 video (stdout pipe to ffmpeg)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int THREADS) {
+    omp_set_num_threads(THREADS);
+    build_age_lut();
+    SET_STDOUT_BINARY();
+
+    // Get header info for progress reporting
+    GolFrameReader reader;
+    if (!reader.open(gol_path)) return;
+    size_t nbytes = reader.nbytes;
+    reader.close();
+
+    // Re-open for streaming
+    GolFrameReader stream;
+    if (!stream.open(gol_path)) return;
+
+    // Age-tracking buffer: same dimensions as bit grid
+    // We allocate one row at a time lazily — for huge grids, don't allocate full age array
+    int grid_w, grid_h;
+    {
+        FILE* f = fopen(gol_path.c_str(), "rb");
+        uint8_t hdr[64]; fread(hdr,1,64,f); fclose(f);
+        auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+        grid_w = ru32(hdr+4); grid_h = ru32(hdr+8);
+    }
+
+    // Age tracking — we update age cell-by-cell as we stream
+    // Use uint8_t for age (0=dead, 1-127=age, 127+ capped)
+    size_t total_cells = (size_t)grid_w * grid_h;
+    uint8_t* ages = (uint8_t*)calloc(1, total_cells);
+    std::vector<uint8_t> prev_row_bits;
+
+    fprintf(stderr,"=== GoL Render from Archive ===\n");
+    fprintf(stderr,"Archive: %s  Render: %dx%d @ %d fps\n", gol_path.c_str(), rW, rH, FPS);
+    fprintf(stderr,"Grid:    %dx%d  Coverage: %.2f x %.2f cells/pixel\n",
+            grid_w, grid_h, (double)grid_w/rW, (double)grid_h/rH);
+    fprintf(stderr,"\n");
+
+    std::vector<uint8_t> frame_buf;
+    size_t frame_bytes = (size_t)rW * rH * 3;
+    auto wall0 = std::chrono::high_resolution_clock::now();
+    int total_frames = 0;
+
+    std::vector<uint8_t> bits;
+    uint32_t live_count;
+    // Read gen 0
+    if (!stream.read_next(live_count, bits)) {
+        free(ages); return;
+    }
+    total_frames++;
+
+    // Compute ages for gen 0: alive = age 1
+    {
+        long long bp = 0;
+        for (int r = 0; r < grid_h; r++) {
+            for (int c = 0; c < grid_w; c++) {
+                int alive = (bits[bp/8] >> (bp%8)) & 1;
+                ages[r * (size_t)grid_w + c] = alive ? 1 : 0;
+                bp++;
+            }
+        }
+    }
+
+    // Render gen 0
+    {
+        Grid temp(grid_w, grid_h);
+        long long bp = 0;
+        for (int r = 0; r < grid_h; r++)
+            for (int c = 0; c < grid_w; c++) {
+                int alive = (bits[bp/8] >> (bp%8)) & 1;
+                if (alive) {
+                    temp.set(r, c, 1);
+                    temp.arow(r)[c] = ages[r * (size_t)grid_w + c];
+                }
+                bp++;
+            }
+        render_frame(temp, rW, rH, frame_buf);
+        fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+    }
+
+    for (int gen = 1; ; gen++) {
+        if (!stream.read_next(live_count, bits)) break;
+        total_frames++;
+
+        // Update ages: XOR with prev bits tells us births and deaths
+        long long bp = 0;
+        for (size_t i = 0; i < total_cells; i++) {
+            int alive = (bits[bp/8] >> (bp%8)) & 1;
+            if (alive) {
+                ages[i] = (ages[i] >= 127) ? 127 : ages[i] + 1;
+            } else {
+                ages[i] = 0;
+            }
+            bp++;
+        }
+
+        // Render using live bits + ages
+        Grid temp(grid_w, grid_h);
+        bp = 0;
+        for (int r = 0; r < grid_h; r++)
+            for (int c = 0; c < grid_w; c++) {
+                int alive = (bits[bp/8] >> (bp%8)) & 1;
+                if (alive) {
+                    temp.set(r, c, 1);
+                    temp.arow(r)[c] = ages[r * (size_t)grid_w + c];
+                }
+                bp++;
+            }
+        render_frame(temp, rW, rH, frame_buf);
+        fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+
+        if (gen % 100 == 0 || gen % 1000 == 0 || gen == 1) fflush(stdout);
+
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(now - wall0).count();
+        if (elapsed >= 1.0 || gen == 1) {
+            fprintf(stderr,"  Frame %5d  %.1f fps           \r",
+                    gen, (double)gen / elapsed);
+        }
+    }
+
+    fflush(stdout);
+    double total = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wall0).count();
+    fprintf(stderr,"\nDone. %d frames in %.1fs (%.1f fps)\n", total_frames, total, total_frames/total);
+    free(ages);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Sim mode (config-driven, stagnation detection, archive)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -991,6 +1466,13 @@ static int run_sim(const Config& cfg) {
 
     fflush(stdout);
 
+    if (!cfg.final_cells_file.empty()) {
+        char namebuf[320];
+        snprintf(namebuf,sizeof(namebuf),"Final state at gen %d (%s)",
+                 final_gen, stag_result.triggered ? "stagnated" : "max_gens reached");
+        write_cells(A, cfg.final_cells_file, namebuf);
+    }
+
     int sp = stag_result.triggered ? stag_result.period : 0;
     int sg = stag_result.triggered ? stag_result.detect_gen : -1;
     archive.close(sp, sg);
@@ -1032,13 +1514,17 @@ static void usage(const char* p) {
         "  %s video  <W> <H> <gens> <fps> <rW> <rH> [threads] [state|pattern] [B3/S23]\n"
         "  %s sim    <config.cfg> [threads]\n"
         "  %s init   <config.cfg>\n"
-        "  %s archive-info <file.gol>\n\n"
+        "  %s archive-info <file.gol>\n"
+        "  %s extract <file.gol> <gen> <out.cells>\n"
+        "  %s render  <file.gol> <rW> <rH> <fps> [threads]\n\n"
         "Pattern names (use directly in place of state file):\n"
         "  glider blinker block r-pentomino acorn pulsar lwss diehard gosper-gun\n\n"
         "Examples:\n"
         "  ./gol video 3840 2160 600 60 1920 1080 8 gosper-gun\n"
         "  ./gol video 1920 1080 500 60 1920 1080 8 glider B3/S23\n"
-        "  ./gol bench 3840 2160 1000 8 glider\n\n"
+        "  ./gol bench 3840 2160 1000 8 glider\n"
+        "  ./gol sim life.cfg                        # saves run.gol\n"
+        "  ./gol render run.gol 1920 1080 60 | ffmpeg ...  # render archive to video\n\n"
         "Video pipe:\n"
         "  ./gol video 3840 2160 600 60 1920 1080 8 | ffmpeg \\\n"
         "    -f rawvideo -pixel_format rgb24 -video_size 1920x1080 -framerate 60 -i - \\\n"
@@ -1048,7 +1534,7 @@ static void usage(const char* p) {
         "  ./gol sim life.cfg\n"
         "  ./gol archive-info run.gol\n\n"
         "Rules: B3/S23 (Conway)  B36/S23 (HighLife)  B3/S12345 (Maze)  B2/S (Seeds)\n",
-        p,p,p,p,p,p);
+        p,p,p,p,p,p,p,p);
 }
 
 int main(int argc, char** argv) {
@@ -1062,6 +1548,11 @@ int main(int argc, char** argv) {
     if (mode=="archive-info") {
         if (argc<3) { fprintf(stderr,"Usage: %s archive-info <file.gol>\n",argv[0]); return 1; }
         archive_info(argv[2]); return 0;
+    }
+    if (mode=="extract") {
+        if (argc<5) { fprintf(stderr,"Usage: %s extract <file.gol> <gen> <out.cells>\n",argv[0]); return 1; }
+        bool ok = run_extract(argv[2], atoi(argv[3]), argv[4]);
+        return ok ? 0 : 1;
     }
     if (mode=="bench") {
         if (argc<5) { usage(argv[0]); return 1; }
@@ -1096,6 +1587,13 @@ int main(int argc, char** argv) {
         if (!parse_config(argv[2],cfg)) return 1;
         if (argc>3) cfg.threads=atoi(argv[3]);
         return run_sim(cfg);
+    }
+    if (mode=="render") {
+        if (argc<6) { usage(argv[0]); return 1; }
+        int rW=atoi(argv[3]), rH=atoi(argv[4]), FPS=atoi(argv[5]);
+        int threads = argc>6 ? atoi(argv[6]) : omp_get_max_threads();
+        run_render(argv[2], rW, rH, FPS, threads);
+        return 0;
     }
 
     usage(argv[0]); return 1;
