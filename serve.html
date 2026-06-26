@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoL Viewer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;overflow:hidden;font-family:system-ui,sans-serif;color:#ccc}
+canvas{display:block;cursor:grab;position:absolute;top:0;left:0}
+canvas:active{cursor:grabbing}
+#controls{position:fixed;bottom:0;left:0;right:0;background:rgba(0,0,0,.85);padding:8px 12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;z-index:10;border-top:1px solid #333;user-select:none}
+#controls button{background:#333;border:1px solid #555;color:#ccc;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px;width:36px}
+#controls button:hover{background:#444}
+#controls button:disabled{opacity:.4;cursor:default}
+#controls label{font-size:12px;color:#888;white-space:nowrap}
+#seek{flex:1;min-width:80px;height:6px;-webkit-appearance:none;appearance:none;background:#222;border-radius:3px;outline:none;cursor:pointer}
+#seek::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#4af;cursor:pointer}
+#seek::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#4af;cursor:pointer}
+#speed{width:50px;background:#222;border:1px solid #444;color:#ccc;padding:2px 6px;border-radius:3px;font-size:12px;text-align:center}
+#info{position:fixed;top:8px;left:8px;color:#888;font-size:12px;background:rgba(0,0,0,.7);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:10}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info">Connecting...</div>
+<div id="controls">
+  <button id="playBtn">⏸</button>
+  <label><span id="genLabel">0</span> / <span id="maxLabel">0</span></label>
+  <input type="range" id="seek" min="0" max="100" value="0">
+  <label>FPS</label>
+  <input type="number" id="speed" value="60" min="1" max="144">
+  <label style="font-size:11px;color:#555">decoded <span id="decodedLabel">0</span></label>
+</div>
+<script>
+const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+let W,H,GRID_W,GRID_H,TOTAL_FRAMES=0,curGen=0,maxLoaded=0;
+let cells=null,cx=null,cy=null,cellColors=null,cellCount=0;
+let scale=1,panX=0,panY=0,dragging=false,dragX,dragY,dragPanX,dragPanY;
+let playing=true,interval=16,loading=false,timeoutId=null,pixBuf=null,pixSize=0;
+// Age tracking
+let prevCellSet=null;
+let cellAgeMap=new Map();
+const MAX_AGE=128;
+const AGEST=[[0,[255,255,255]],[.2,[255,255,0]],[.4,[255,165,0]],[.6,[152,255,152]],[.8,[100,200,255]],[1,[0,0,255]]];
+function ageColor(age){
+  const t=Math.min(age/MAX_AGE,1);
+  for(let i=0;i<AGEST.length-1;i++)if(t>=AGEST[i][0]&&t<AGEST[i+1][0]){
+    const l=(t-AGEST[i][0])/(AGEST[i+1][0]-AGEST[i][0]);
+    const a=AGEST[i][1],b=AGEST[i+1][1];
+    const r=a[0]+(b[0]-a[0])*l,g=a[1]+(b[1]-a[1])*l,bl=a[2]+(b[2]-a[2])*l;
+    return 0xFF000000|Math.round(r)<<16|Math.round(g)<<8|Math.round(bl);
+  }
+  return 0xFF000028;
+}
+
+function resize(){W=canvas.width=window.innerWidth;H=canvas.height=window.innerHeight;draw()}
+window.onresize=resize;
+
+function fitToScreen(){
+  resize();
+  const sx=W/GRID_W,sy=H/GRID_H;
+  scale=Math.min(sx,sy)*0.9;
+  panX=(W-GRID_W*scale)/2;
+  panY=(H-GRID_H*scale)/2;
+  draw();
+}
+
+function draw(tNet,tParse){
+  if(!cellCount)return;
+  const t0=performance.now();
+  const needed=W*H;
+  if(needed!==pixSize){pixBuf=new Uint32Array(needed);pixSize=needed}
+  const d=pixBuf;
+  d.fill(0);
+
+  if(scale>=1){
+    // ——— Each cell is ≥1 screen pixel — draw as integer-aligned tiles ———
+    const sz=Math.round(scale);
+    const vpL=-panX/scale,vpT=-panY/scale;
+    const vpR=vpL+W/scale,vpB=vpT+H/scale;
+    const minX=Math.max(0,Math.floor(vpL)),minY=Math.max(0,Math.floor(vpT));
+    const maxX=Math.min(GRID_W,Math.ceil(vpR)),maxY=Math.min(GRID_H,Math.ceil(vpB));
+    for(let i=0;i<cellCount;i++){
+      const x=cx[i],y=cy[i];
+      if(x>=minX&&x<maxX&&y>=minY&&y<maxY){
+        let sx=Math.round(panX+x*scale),sy=Math.round(panY+y*scale);
+        if(sx<0)sx=0;if(sy<0)sy=0;
+        const mx=Math.min(sx+sz,W),my=Math.min(sy+sz,H);
+        const col=cellColors[i];
+        for(let dy=sy;dy<my;dy++)for(let dx=sx;dx<mx;dx++)d[dy*W+dx]=col;
+      }
+    }
+  }else{
+    // ——— Sub-pixel LOD: bin visible viewport only ———
+    const vpL=-panX/scale,vpT=-panY/scale;
+    const vpR=vpL+W/scale,vpB=vpT+H/scale;
+    const gx0=Math.max(0,Math.floor(vpL)),gy0=Math.max(0,Math.floor(vpT));
+    const gx1=Math.min(GRID_W,Math.ceil(vpR)),gy1=Math.min(GRID_H,Math.ceil(vpB));
+    const vpW=gx1-gx0,vpH=gy1-gy0;
+    const step=Math.ceil(1/scale);
+    const binW=Math.ceil(vpW/step),binH=Math.ceil(vpH/step);
+    const counts=new Uint16Array(Math.max(1,binW*binH));
+    for(let i=0;i<cellCount;i++){
+      const x=cx[i],y=cy[i];
+      if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1){
+        const bx=Math.floor((x-gx0)/step),by=Math.floor((y-gy0)/step);
+        counts[by*binW+bx]++;
+      }
+    }
+    const threshold=0;
+    const sx0=Math.round(panX+gx0*scale),sy0=Math.round(panY+gy0*scale);
+    const bsp=step*scale;
+    const bsi=Math.max(1,Math.ceil(bsp));
+    for(let by=0;by<binH;by++){
+      const sy=sy0+Math.round(by*bsp);
+      if(sy>=H)break;
+      for(let bx=0;bx<binW;bx++){
+        if(counts[by*binW+bx]>threshold){
+          const sx=sx0+Math.round(bx*bsp);
+          if(sx>=W)break;
+          const mx=Math.min(sx+bsi,W),my=Math.min(sy+bsi,H);
+          for(let dy=sy;dy<my;dy++)for(let dx=sx;dx<mx;dx++)d[dy*W+dx]=0xFFFFFFFF;
+        }
+      }
+    }
+  }
+
+  // Blit pixel buffer to canvas via Uint32 view (single copy)
+  const img=ctx.createImageData(W,H);
+  new Uint32Array(img.data.buffer).set(d);
+  ctx.putImageData(img,0,0);
+  // Time info
+  const now=performance.now();
+  let parts=[`${GRID_W}x${GRID_H}  ${TOTAL_FRAMES.toLocaleString()} frames`];
+  if(tNet!==undefined)parts.push(`net:${(tParse-tNet).toFixed(0)}ms`);
+  if(tParse!==undefined)parts.push(`parse:${(t0-tParse).toFixed(0)}ms`);
+  parts.push(`draw:${(now-t0).toFixed(1)}ms`);
+  document.getElementById('info').textContent=parts.join('  ');
+}
+
+canvas.onwheel=e=>{
+  e.preventDefault();
+  const os=scale,mx=e.clientX,my=e.clientY;
+  scale*=e.deltaY>0?.85:1.18;
+  scale=Math.max(.005,Math.min(scale,64));
+  panX=mx-(mx-panX)*scale/os;
+  panY=my-(my-panY)*scale/os;
+  draw();
+};
+canvas.onmousedown=e=>{dragging=true;dragX=e.clientX;dragY=e.clientY;dragPanX=panX;dragPanY=panY};
+canvas.onmousemove=e=>{if(dragging){panX=dragPanX+(e.clientX-dragX);panY=dragPanY+(e.clientY-dragY);draw()}};
+canvas.onmouseup=canvas.onmouseleave=()=>{dragging=false};
+
+function scheduleNext(){
+  if(timeoutId){clearTimeout(timeoutId);timeoutId=null}
+  if(playing&&!loading&&curGen<TOTAL_FRAMES-1)
+    timeoutId=setTimeout(()=>loadGen(curGen+1),interval);
+}
+
+document.getElementById('playBtn').onclick=()=>{
+  playing=!playing;
+  document.getElementById('playBtn').textContent=playing?'⏸':'▶';
+  if(playing)scheduleNext();
+  else if(timeoutId){clearTimeout(timeoutId);timeoutId=null}
+};
+document.getElementById('speed').onchange=function(){
+  const fps=Math.max(1,Math.min(144,parseInt(this.value)||60));
+  interval=1000/fps;
+  if(playing)scheduleNext();
+};
+document.getElementById('seek').oninput=function(){
+  if(!maxLoaded)return;
+  const gen=Math.round(this.value/100*maxLoaded);
+  if(gen!==curGen)loadGen(gen);
+};
+
+async function loadGen(gen){
+  if(loading||gen<0||gen>=TOTAL_FRAMES)return;
+  loading=true;
+  curGen=gen;
+  document.getElementById('genLabel').textContent=gen;
+  document.getElementById('seek').value=maxLoaded>0?gen/maxLoaded*100:0;
+  const tNet=performance.now();
+  try{
+    const res=await fetch(`/frame?gen=${gen}`);
+    const buf=await res.arrayBuffer();
+    const tParse=performance.now();
+    const view=new DataView(buf);
+    const count=view.getUint32(0,true);
+    cellCount=count;
+    cx=new Uint16Array(count);
+    cy=new Uint16Array(count);
+    for(let i=0;i<count;i++){cx[i]=view.getUint16(4+i*4,true);cy[i]=view.getUint16(6+i*4,true)}
+
+    // Compute ages & colors
+    const curSet=new Set();
+    const ages=new Uint8Array(count);
+    for(let i=0;i<count;i++){
+      const key=(cy[i]<<16)|cx[i];
+      curSet.add(key);
+      const prev=cellAgeMap.get(key);
+      ages[i]=prev!==undefined?Math.min(prev+1,255):0;
+    }
+    // Remove dead cells
+    if(prevCellSet)for(const key of prevCellSet)if(!curSet.has(key))cellAgeMap.delete(key);
+    // Update ages
+    for(let i=0;i<count;i++){
+      const key=(cy[i]<<16)|cx[i];
+      cellAgeMap.set(key,ages[i]);
+    }
+    prevCellSet=curSet;
+
+    cellColors=new Uint32Array(count);
+    for(let i=0;i<count;i++)cellColors[i]=ageColor(ages[i]);
+
+    if(gen>maxLoaded){maxLoaded=gen;document.getElementById('decodedLabel').textContent=maxLoaded}
+    document.getElementById('maxLabel').textContent=maxLoaded;
+    document.getElementById('seek').value=maxLoaded>0?gen/maxLoaded*100:0;
+    draw(tNet,tParse);
+  }catch(e){document.getElementById('info').textContent='Error: '+e.message}
+  loading=false;
+  scheduleNext();
+}
+
+async function init(){
+  try{
+    const res=await fetch('/info');
+    const info=await res.json();
+    GRID_W=info.w;GRID_H=info.h;TOTAL_FRAMES=info.frames;
+    document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  ${TOTAL_FRAMES.toLocaleString()} frames`;
+    fitToScreen();
+    await loadGen(0);
+  }catch(e){
+    document.getElementById('info').textContent='Cannot connect to server';
+    document.getElementById('playBtn').disabled=true;
+  }
+}
+
+init();
+</script>
+</body>
+</html>

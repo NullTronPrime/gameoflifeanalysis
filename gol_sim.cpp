@@ -107,6 +107,10 @@
 
 #include <cstdint>
 #include <cstdlib>
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib")
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -117,14 +121,60 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cassert>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 #include <omp.h>
 #include <zstd.h>
 
 #ifdef _WIN32
   #include <io.h>
   #include <fcntl.h>
+  #include <windows.h>
   #define SET_STDOUT_BINARY() _setmode(_fileno(stdout), _O_BINARY)
+  static volatile bool g_stop_requested = false;
+  static BOOL WINAPI ctrl_handler(DWORD dwCtrlType) {
+      if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_BREAK_EVENT) {
+          g_stop_requested = true;
+          fprintf(stderr, "\nStop requested — finishing current gen...\n");
+          return TRUE;
+      }
+      return FALSE;
+  }
+  // Returns false if free space on the drive containing `path` is below `min_free_mb`.
+  static bool enough_disk_space(const std::string& path, uint64_t min_free_mb) {
+      std::string root;
+      if (path.size() >= 2 && path[1] == ':') root = path.substr(0, 3);
+      else if (!path.empty() && path[0] == '/') {
+          size_t pos = path.find('/', 1);
+          root = (pos != std::string::npos) ? path.substr(0, pos + 1) : "/";
+      } else root = ".";
+      ULARGE_INTEGER free_bytes = {};
+      if (GetDiskFreeSpaceExA(root.c_str(), &free_bytes, NULL, NULL))
+          return free_bytes.QuadPart >= (uint64_t)min_free_mb * 1048576ULL;
+      return true; // can't check → assume OK
+  }
 #else
+  #include <signal.h>
+  #include <sys/statvfs.h>
+  static volatile bool g_stop_requested = false;
+  static void ctrl_handler(int) {
+      g_stop_requested = true;
+      fprintf(stderr, "\nStop requested — finishing current gen...\n");
+  }
+  static bool enough_disk_space(const std::string& path, uint64_t min_free_mb) {
+      std::string dir = path;
+      auto pos = dir.rfind('/');
+      if (pos != std::string::npos) dir = dir.substr(0, pos);
+      if (dir.empty()) dir = ".";
+      struct statvfs buf;
+      if (statvfs(dir.c_str(), &buf) == 0) {
+          uint64_t free = (uint64_t)buf.f_frsize * buf.f_bavail;
+          return free >= (uint64_t)min_free_mb * 1048576ULL;
+      }
+      return true;
+  }
   #define SET_STDOUT_BINARY() ((void)0)
 #endif
 
@@ -186,7 +236,9 @@ struct Config {
     int   cycle_window    = 1024;
     std::string archive_file;
     int   archive_every   = 1;
+    std::string resume_file;
     std::string final_cells_file;
+    uint64_t stop_at_free_gb  = 0;   // 0 = disabled; otherwise stop when drive has <= this many GB free
 
     bool has_video() const { return video_w > 0 && video_h > 0; }
     bool has_archive() const { return !archive_file.empty(); }
@@ -248,7 +300,9 @@ static bool parse_config(const std::string& path, Config& cfg) {
         else if (k=="cycle_window")     cfg.cycle_window    = atoi(v.c_str());
         else if (k=="archive_file")     cfg.archive_file    = v;
         else if (k=="archive_every")    cfg.archive_every   = atoi(v.c_str());
+        else if (k=="resume_file")      cfg.resume_file     = v;
         else if (k=="final_cells_file") cfg.final_cells_file = v;
+        else if (k=="stop_at_free_gb")  cfg.stop_at_free_gb = (uint64_t)atoll(v.c_str());
     }
     fclose(f);
     if (cfg.threads <= 0) cfg.threads = omp_get_max_threads();
@@ -278,7 +332,7 @@ static void write_default_config(const std::string& path) {
         "video_w         = 1920\n"
         "video_h         = 1080\n"
         "video_fps       = 60\n\n"
-        "max_gens        = 100000\n\n"
+        "max_gens        = 0            # 0 = unlimited (run until stagnation)\n\n"
         "# Stagnation detection\n"
         "stagnation      = 1\n"
         "detect_extinction = 1\n"
@@ -291,6 +345,7 @@ static void write_default_config(const std::string& path) {
         "# Optional: dump the final (stagnated) state as a .cells file for a\n"
         "# quick look in Golly / LifeViewer. Trims to the live-cell bounding box.\n"
         "final_cells_file =            # e.g. final_state.cells\n"
+        "stop_at_free_gb  = 0          # 0 = disabled; stop when drive has <= this many GB free\n"
     );
     fclose(f);
     fprintf(stderr, "Wrote default config: %s\n", path.c_str());
@@ -507,8 +562,17 @@ static uint8_t* block_sparse_encode(const uint8_t* data, size_t nbytes, size_t* 
         size_t remain = nbytes - off;
         size_t blen = (remain < GOL_BLOCK_SIZE) ? remain : GOL_BLOCK_SIZE;
         bool all_zero = true;
-        for (size_t j = 0; j < blen; j++) {
-            if (data[off + j]) { all_zero = false; break; }
+        // Check 8 bytes at a time via uint64_t (8x faster than byte loop)
+        const uint64_t* w64 = (const uint64_t*)(data + off);
+        size_t nw = blen / 8;
+        for (size_t w = 0; w < nw; w++) {
+            if (w64[w]) { all_zero = false; break; }
+        }
+        if (all_zero) {
+            // Check remaining bytes (blen % 8)
+            for (size_t j = nw * 8; j < blen; j++) {
+                if (data[off + j]) { all_zero = false; break; }
+            }
         }
         if (!all_zero) {
             mask[i / 8] |= (uint8_t)(1 << (i % 8));
@@ -522,6 +586,38 @@ static uint8_t* block_sparse_encode(const uint8_t* data, size_t nbytes, size_t* 
     memcpy(result, mask.data(), mask_bytes);
     if (!blocks.empty()) memcpy(result + mask_bytes, blocks.data(), blocks.size());
     return result;
+}
+
+// Block-sparse encode to pre-allocated buffer. Returns compressed size.
+// output must have room for mask_bytes + nbytes (worst case: all blocks non-zero).
+static size_t block_sparse_encode_to(const uint8_t* data, size_t nbytes, uint8_t* output) {
+    size_t nblocks = (nbytes + GOL_BLOCK_SIZE - 1) / GOL_BLOCK_SIZE;
+    size_t mask_bytes = (nblocks + 7) / 8;
+    memset(output, 0, mask_bytes);
+    uint8_t* write_head = output + mask_bytes;
+
+    for (size_t i = 0; i < nblocks; i++) {
+        size_t off = i * GOL_BLOCK_SIZE;
+        size_t remain = nbytes - off;
+        size_t blen = (remain < GOL_BLOCK_SIZE) ? remain : GOL_BLOCK_SIZE;
+        bool all_zero = true;
+        const uint64_t* w64 = (const uint64_t*)(data + off);
+        size_t nw = blen / 8;
+        for (size_t w = 0; w < nw; w++) {
+            if (w64[w]) { all_zero = false; break; }
+        }
+        if (all_zero) {
+            for (size_t j = nw * 8; j < blen; j++) {
+                if (data[off + j]) { all_zero = false; break; }
+            }
+        }
+        if (!all_zero) {
+            output[i / 8] |= (uint8_t)(1 << (i % 8));
+            memcpy(write_head, data + off, blen);
+            write_head += blen;
+        }
+    }
+    return (size_t)(write_head - output);
 }
 
 // Block-sparse decode: inverse of above.
@@ -549,18 +645,39 @@ static uint8_t* block_sparse_decode(const uint8_t* compressed, size_t csize, siz
     return result;
 }
 
-// Zstd wrapper: compress src (size) → *dst, *dst_size allocated by malloc.
-static bool zstd_compress(const uint8_t* src, size_t size, uint8_t** dst, size_t* dst_size, int level) {
-    size_t bound = ZSTD_compressBound(size);
-    *dst = (uint8_t*)malloc(bound);
-    if (!*dst) return false;
-    *dst_size = ZSTD_compress(*dst, bound, src, size, level);
-    if (ZSTD_isError(*dst_size)) { free(*dst); *dst = nullptr; return false; }
-    // Shrink allocation
-    uint8_t* shrunk = (uint8_t*)realloc(*dst, *dst_size);
-    if (shrunk) *dst = shrunk;
-    return true;
-}
+// Persistent zstd compression context with multi-threading support.
+struct ZstdCompressor {
+    ZSTD_CCtx* cctx = nullptr;
+    int threads = 4;
+
+    bool init(int level, int nthreads) {
+        cctx = ZSTD_createCCtx();
+        if (!cctx) return false;
+        threads = (nthreads < 1) ? 1 : nthreads;
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
+        if (threads > 1)
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, threads);
+        return true;
+    }
+
+    // Compress src → *dst, *dst_size. dst is reallocated as needed.
+    // Caller should init *dst=NULL, *dst_size=0 before first call.
+    // Returns false on error. *dst is freed on error.
+    bool compress(const uint8_t* src, size_t size, uint8_t** dst, size_t* dst_size) {
+        size_t bound = ZSTD_compressBound(size);
+        uint8_t* buf = (uint8_t*)realloc(*dst, bound);
+        if (!buf) { free(*dst); *dst = nullptr; return false; }
+        *dst = buf;
+        size_t res = ZSTD_compress2(cctx, buf, bound, src, size);
+        if (ZSTD_isError(res)) { free(*dst); *dst = nullptr; return false; }
+        uint8_t* shrunk = (uint8_t*)realloc(buf, res);
+        if (shrunk) *dst = shrunk;
+        *dst_size = res;
+        return true;
+    }
+
+    ~ZstdCompressor() { if (cctx) ZSTD_freeCCtx(cctx); }
+};
 
 static bool zstd_decompress(const uint8_t* src, size_t src_size, uint8_t** dst, size_t dst_size) {
     *dst = (uint8_t*)malloc(dst_size);
@@ -583,15 +700,133 @@ struct GolArchive {
     uint8_t  rule_S   = 12;
     uint32_t fps_hint = 0;
     uint8_t  compression = GOL_COMPRESS_DELTA;
-    int      zstd_level  = 19;
+    int      zstd_level  = 3;
     size_t   nbytes      = 0;
     uint8_t* prev_bits   = nullptr;
 
     static const size_t HEADER_SIZE = 64;
+    static const size_t QUEUE_CAPACITY = 64;
+
+    // Reusable buffers to eliminate per-frame heap churn
+    std::vector<uint8_t> delta_buf;
+    uint8_t* sparse_buf  = nullptr;
+    size_t   sparse_cap  = 0;
+    uint8_t* cdata_buf   = nullptr;
+    ZstdCompressor zc;
+
+    struct QueuedFrame {
+        std::vector<uint8_t> cur;
+        int    gen;
+        long long live_count;
+    };
+
+    std::queue<QueuedFrame> queue_;
+    std::mutex              queue_mtx;
+    std::condition_variable queue_cv;
+    bool                    writer_done_ = false;
+    bool                    error_       = false;
+    std::thread             writer_thread_;
+
+    // Ensure sparse_buf is at least `need` bytes
+    void ensure_sparse(size_t need) {
+        if (need > sparse_cap) {
+            free(sparse_buf);
+            sparse_buf = (uint8_t*)malloc(need);
+            sparse_cap = sparse_buf ? need : 0;
+        }
+    }
+
+    // Thread worker: processes queued frames sequentially (delta+zstd+write)
+    void writer_loop() {
+        size_t mask_bytes = ((nbytes + GOL_BLOCK_SIZE - 1) / GOL_BLOCK_SIZE + 7) / 8;
+        size_t sparse_need = mask_bytes + nbytes;
+        ensure_sparse(sparse_need);
+        delta_buf.resize(nbytes);
+
+        while (true) {
+            QueuedFrame qf;
+            {
+                std::unique_lock<std::mutex> lock(queue_mtx);
+                queue_cv.wait(lock, [this]{ return !queue_.empty() || writer_done_; });
+                if (queue_.empty() && writer_done_) return;
+                if (error_) { // drain queue without writing on error
+                    queue_.pop();
+                    queue_cv.notify_one();
+                    continue;
+                }
+                qf = std::move(queue_.front());
+                queue_.pop();
+            }
+            queue_cv.notify_one();
+
+            auto checked_fwrite = [&](const void* buf, size_t sz) -> bool {
+                if (fwrite(buf, 1, sz, fp) != sz) {
+                    std::lock_guard<std::mutex> lock(queue_mtx);
+                    error_ = true;
+                    fprintf(stderr, "\nArchive write error at gen %lld — stopping archive\n",
+                            (long long)qf.gen);
+                    return false;
+                }
+                return true;
+            };
+
+            uint8_t* data = qf.cur.data();
+            uint8_t* sparse = sparse_buf;
+            size_t sparse_size = 0;
+
+            if (compression == GOL_COMPRESS_DELTA && qf.gen > 0) {
+                // XOR delta into reusable delta_buf
+                uint8_t* delta = delta_buf.data();
+                size_t nwords = nbytes / 8;
+                uint64_t* d64 = (uint64_t*)delta;
+                const uint64_t* c64 = (const uint64_t*)data;
+                const uint64_t* p64 = (const uint64_t*)prev_bits;
+                for (size_t i = 0; i < nwords; i++) d64[i] = c64[i] ^ p64[i];
+                for (size_t i = nwords * 8; i < nbytes; i++) delta[i] = data[i] ^ prev_bits[i];
+
+                sparse_size = block_sparse_encode_to(delta, nbytes, sparse);
+            } else {
+                sparse_size = block_sparse_encode_to(data, nbytes, sparse);
+            }
+
+            if (sparse_size > 0) {
+                size_t csize = 0;
+                if (zc.compress(sparse, sparse_size, &cdata_buf, &csize)) {
+                    uint8_t fhdr[21];
+                    write_u64(fhdr+0, (uint64_t)qf.gen);
+                    write_u32(fhdr+8, (uint32_t)qf.live_count);
+                    fhdr[12] = GOL_COMPRESS_DELTA;
+                    write_u32(fhdr+13, (uint32_t)sparse_size);
+                    write_u32(fhdr+17, (uint32_t)csize);
+                    if (checked_fwrite(fhdr, 21) && checked_fwrite(cdata_buf, csize)) {
+                        memcpy(prev_bits, data, nbytes);
+                        gen_count++;
+                    }
+                }
+            }
+        }
+    }
+
+    void start_writer() {
+        writer_done_ = false;
+        writer_thread_ = std::thread(&GolArchive::writer_loop, this);
+    }
+
+    bool has_error() const { return error_; }
+
+    // ─── Public API ───
+
+    void init_compressor() {
+        // Use min(threads/2, 4) zstd worker threads
+        int nt = omp_get_max_threads() / 2;
+        if (nt > 6) nt = 6;
+        if (nt < 1) nt = 1;
+        zc.init(zstd_level, nt);
+    }
 
     bool open(const std::string& path, int W, int H,
               uint8_t B, uint8_t S, uint32_t fps=0,
-              uint8_t comp=GOL_COMPRESS_DELTA, int zl=19) {
+              uint8_t comp=GOL_COMPRESS_DELTA, int zl=3) {
         fp = fopen(path.c_str(), "wb");
         if (!fp) { fprintf(stderr,"Archive: cannot open '%s'\n",path.c_str()); return false; }
         grid_w=W; grid_h=H; rule_B=B; rule_S=S; fps_hint=fps;
@@ -599,6 +834,7 @@ struct GolArchive {
         nbytes = (size_t)((size_t)W*H+7)/8;
         prev_bits = (uint8_t*)calloc(1, nbytes);
         if (!prev_bits) { fclose(fp); fp=nullptr; return false; }
+        init_compressor();
         uint8_t hdr[HEADER_SIZE] = {};
         hdr[0]='G'; hdr[1]='O'; hdr[2]='L'; hdr[3]='1';
         write_u32(hdr+4,  W);
@@ -611,95 +847,138 @@ struct GolArchive {
         hdr[36] = compression;
         hdr[37] = (uint8_t)zstd_level;
         fwrite(hdr, 1, HEADER_SIZE, fp);
+        start_writer();
         return true;
     }
 
+    // Sim thread: memcpy bits, push to queue. Writer handles everything else.
     void write_frame(int gen, long long live_count, const Grid& g) {
         if (!fp) return;
-        // Pack grid bits into byte array
-        std::vector<uint8_t> cur(nbytes, 0);
-        long long bit_pos = 0;
-        for (int r=0; r<g.H; r++) {
-            const uint64_t* row = g.brow(r);
-            for (int c=0; c<g.W; c++) {
-                if ((row[c/64] >> (c%64)) & 1) cur[bit_pos/8] |= (1 << (bit_pos%8));
-                bit_pos++;
-            }
-        }
+        int rw_bytes = (g.W + 7) / 8;
+        QueuedFrame qf;
+        qf.cur.resize(nbytes);
+        qf.gen = gen;
+        qf.live_count = live_count;
+        for (int r = 0; r < g.H; r++)
+            memcpy(qf.cur.data() + (size_t)r * rw_bytes, g.brow(r), rw_bytes);
 
-        if (compression == GOL_COMPRESS_DELTA && gen > 0) {
-            // Delta encode: XOR with previous frame
-            std::vector<uint8_t> delta(nbytes);
-            for (size_t i = 0; i < nbytes; i++) delta[i] = cur[i] ^ prev_bits[i];
-
-            // Block-sparse encode the delta
-            size_t sparse_size = 0;
-            uint8_t* sparse = block_sparse_encode(delta.data(), nbytes, &sparse_size);
-            if (!sparse) { /* fall through to raw */ goto write_raw; }
-
-            // zstd compress the sparse data
-            size_t csize = 0;
-            uint8_t* cdata = nullptr;
-            if (!zstd_compress(sparse, sparse_size, &cdata, &csize, zstd_level)) {
-                free(sparse); goto write_raw;
-            }
-
-            // Write compressed frame header: 8+4+1+4+4 + csize
-            uint8_t fhdr[21];
-            write_u64(fhdr+0, (uint64_t)gen);
-            write_u32(fhdr+8, (uint32_t)live_count);
-            fhdr[12] = GOL_COMPRESS_DELTA;
-            write_u32(fhdr+13, (uint32_t)sparse_size);
-            write_u32(fhdr+17, (uint32_t)csize);
-            fwrite(fhdr, 1, 21, fp);
-            fwrite(cdata, 1, csize, fp);
-            free(sparse); free(cdata);
-        } else {
-            // Frame 0 or raw mode: block-sparse + zstd
-            write_raw: {
-                size_t sparse_size = 0;
-                uint8_t* sparse = block_sparse_encode(cur.data(), nbytes, &sparse_size);
-                size_t csize = 0;
-                uint8_t* cdata = nullptr;
-                if (sparse && zstd_compress(sparse, sparse_size, &cdata, &csize, zstd_level)) {
-                    uint8_t fhdr[21];
-                    write_u64(fhdr+0, (uint64_t)gen);
-                    write_u32(fhdr+8, (uint32_t)live_count);
-                    fhdr[12] = GOL_COMPRESS_DELTA;
-                    write_u32(fhdr+13, (uint32_t)sparse_size);
-                    write_u32(fhdr+17, (uint32_t)csize);
-                    fwrite(fhdr, 1, 21, fp);
-                    fwrite(cdata, 1, csize, fp);
-                    free(sparse); free(cdata);
-                } else {
-                    free(sparse);
-                    // Fallback: raw uncompressed frame
-                    uint8_t fhdr[12];
-                    write_u64(fhdr+0, (uint64_t)gen);
-                    write_u32(fhdr+8, (uint32_t)live_count);
-                    fwrite(fhdr, 1, 12, fp);
-                    fwrite(cur.data(), 1, nbytes, fp);
-                }
-            }
-        }
-
-        // Save as previous for next delta
-        memcpy(prev_bits, cur.data(), nbytes);
-        gen_count++;
+        std::unique_lock<std::mutex> lock(queue_mtx);
+        queue_cv.wait(lock, [this]{ return queue_.size() < QUEUE_CAPACITY; });
+        queue_.push(std::move(qf));
+        queue_cv.notify_one();
     }
 
     void close(int stag_period=-1, int stag_gen=-1) {
         if (!fp) return;
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx);
+            writer_done_ = true;
+        }
+        queue_cv.notify_all();
+        if (writer_thread_.joinable()) writer_thread_.join();
+
         fseek(fp, 12, SEEK_SET);
         uint8_t tmp[8];
         write_u32(tmp, gen_count);  fwrite(tmp, 1, 4, fp);
         fseek(fp, 28, SEEK_SET);
         write_i32(tmp, stag_period); fwrite(tmp, 1, 4, fp);
         fclose(fp); fp=nullptr;
-        free(prev_bits); prev_bits=nullptr;
+        if (prev_bits) { free(prev_bits); prev_bits = nullptr; }
+        free(sparse_buf);  sparse_buf = nullptr; sparse_cap = 0;
+        free(cdata_buf);   cdata_buf  = nullptr;
     }
 
-    ~GolArchive() { if (fp) close(); else free(prev_bits); }
+    bool open_append(const std::string& path, int& out_frame_count,
+                     Grid* grid_out = nullptr) {
+        fp = fopen(path.c_str(), "r+b");
+        if (!fp) { fprintf(stderr,"Cannot open '%s' for append\n",path.c_str()); return false; }
+        uint8_t hdr[64];
+        if (fread(hdr,1,64,fp)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+            fprintf(stderr,"Not a valid .gol file\n"); fclose(fp); fp=nullptr; return false;
+        }
+        auto ru32=[&](uint8_t* p){ return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); };
+        grid_w   = ru32(hdr+4);
+        grid_h   = ru32(hdr+8);
+        fps_hint = ru32(hdr+16);
+        rule_B   = hdr[20];
+        rule_S   = hdr[24];
+        compression = hdr[36];
+        zstd_level  = hdr[37];
+        nbytes = (size_t)((size_t)grid_w*grid_h+7)/8;
+
+        uint8_t* bits = (uint8_t*)calloc(1, nbytes);
+        prev_bits = (uint8_t*)calloc(1, nbytes);
+        if (!bits || !prev_bits) { free(bits); free(prev_bits); fclose(fp); fp=nullptr; return false; }
+
+        uint32_t actual_frames = 0;
+        std::vector<uint8_t> cdata;
+        auto t_scan = std::chrono::high_resolution_clock::now();
+        while (true) {
+            if (compression == GOL_COMPRESS_DELTA) {
+                uint8_t fhdr[21];
+                if (fread(fhdr,1,21,fp)!=21) break;
+                uint32_t usize = ru32(fhdr+13);
+                uint32_t csize = ru32(fhdr+17);
+                if (csize > 100*1024*1024) break;
+                if (csize > cdata.size()) cdata.resize(csize);
+                if (fread(cdata.data(),1,csize,fp)!=csize) break;
+                uint8_t* sparse = nullptr;
+                if (!zstd_decompress(cdata.data(),csize,&sparse,usize)) { free(sparse); break; }
+                size_t dn=0; uint8_t* dec = block_sparse_decode(sparse,usize,nbytes,&dn);
+                free(sparse);
+                if (!dec) break;
+                if (actual_frames==0) {
+                    memcpy(bits,dec,nbytes);
+                    memcpy(prev_bits,dec,nbytes);
+                } else {
+                    size_t nw = nbytes / 8;
+                    uint64_t* b64 = (uint64_t*)bits;
+                    uint64_t* p64 = (uint64_t*)prev_bits;
+                    const uint64_t* d64 = (const uint64_t*)dec;
+                    for (size_t i = 0; i < nw; i++) {
+                        uint64_t v = d64[i] ^ p64[i];
+                        p64[i] = v;
+                        b64[i] = v;
+                    }
+                    for (size_t i = nw * 8; i < nbytes; i++) {
+                        uint8_t v = dec[i] ^ prev_bits[i];
+                        prev_bits[i] = v;
+                        bits[i] = v;
+                    }
+                }
+                free(dec);
+                actual_frames++;
+                if ((actual_frames % 100000) == 0) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    double secs = std::chrono::duration<double>(now - t_scan).count();
+                    fprintf(stderr,"\r  Scanned %u frames (%.1f sec)...", actual_frames, secs);
+                }
+            } else break;
+        }
+        if (actual_frames >= 100000) fprintf(stderr,"\n");
+
+        gen_count = actual_frames;
+        out_frame_count = (int)actual_frames;
+
+        if (actual_frames == 0) {
+            free(bits);
+            fseek(fp, 64, SEEK_SET);
+        } else {
+            if (grid_out) {
+                int rw_bytes = (grid_out->W + 7) / 8;
+                for (int r = 0; r < grid_out->H; r++)
+                    memcpy(grid_out->brow(r), bits + (size_t)r * rw_bytes, rw_bytes);
+            }
+            memcpy(prev_bits, bits, nbytes);
+            free(bits);
+        }
+        fseek(fp, 0, SEEK_END);
+        init_compressor();
+        start_writer();
+        return true;
+    }
+
+    ~GolArchive() { close(); }
 
     static void write_u32(uint8_t* p, uint32_t v) {
         p[0]=v&0xff; p[1]=(v>>8)&0xff; p[2]=(v>>16)&0xff; p[3]=(v>>24)&0xff;
@@ -1060,6 +1339,91 @@ struct GolFrameReader {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Analyse: scan archive frames to find union bounding box of all live cells
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void run_analyse(const std::string& path) {
+    GolFrameReader reader;
+    if (!reader.open(path)) return;
+    size_t nbytes = reader.nbytes;
+
+    FILE* f = fopen(path.c_str(), "rb");
+    uint8_t hdr[64]; fread(hdr,1,64,f); fclose(f);
+    auto ru32=[&](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+    int grid_w = ru32(hdr+4), grid_h = ru32(hdr+8);
+    int rw = (grid_w + 63) / 64;
+    int row_bytes = (grid_w + 7) / 8;
+
+    fprintf(stderr,"=== Analysing Archive ===\n");
+    fprintf(stderr,"Grid: %dx%d\n", grid_w, grid_h);
+
+    int min_r=grid_h, max_r=-1, min_c=grid_w, max_c=-1;
+    int total_frames = 0;
+    uint32_t live_count;
+    std::vector<uint8_t> bits;
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    while (reader.read_next(live_count, bits)) {
+        if (live_count == 0) { total_frames++; continue; }
+
+        for (int r = 0; r < grid_h; r++) {
+            const uint8_t* row = bits.data() + (size_t)r * row_bytes;
+            bool row_has_cells = false;
+
+            for (int w = 0; w < rw; w++) {
+                uint64_t word = 0;
+                int boff = w * 8;
+                int remain = row_bytes - boff;
+                if (remain >= 8) {
+                    word = *(const uint64_t*)(row + boff);
+                } else if (remain > 0) {
+                    for (int b = 0; b < remain; b++)
+                        word |= (uint64_t)row[boff + b] << (b * 8);
+                }
+                if (word == 0) continue;
+
+                row_has_cells = true;
+                int base = w * 64;
+                int first = __builtin_ctzll(word);
+                int last  = 63 - __builtin_clzll(word);
+                int c0 = base + first;
+                int c1 = base + last;
+                if (c0 < grid_w && c0 < min_c) min_c = c0;
+                if (c1 < grid_w && c1 > max_c) max_c = c1;
+            }
+
+            if (row_has_cells) {
+                if (r < min_r) min_r = r;
+                if (r > max_r) max_r = r;
+            }
+        }
+
+        total_frames++;
+        if (total_frames % 500 == 0) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double sec = std::chrono::duration<double>(now - t0).count();
+            fprintf(stderr,"  Frame %d  (%.0f fps, bbox: %d..%d x %d..%d)\r",
+                    total_frames, total_frames/sec,
+                    min_r, max_r, min_c, max_c);
+        }
+    }
+
+    reader.close();
+    double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    fprintf(stderr,"\n\n=== Analysis Complete ===\n");
+    fprintf(stderr,"Frames:      %d\n", total_frames);
+    fprintf(stderr,"Time:        %.1fs (%.0f fps)\n", elapsed, total_frames/elapsed);
+    if (max_r >= 0) {
+        fprintf(stderr,"Live bbox:   rows %d..%d  cols %d..%d\n", min_r, max_r, min_c, max_c);
+        fprintf(stderr,"Bbox size:   %d x %d  (%.1f%% of grid)\n",
+                max_r-min_r+1, max_c-min_c+1,
+                100.0 * (max_r-min_r+1) * (max_c-min_c+1) / (grid_w*grid_h));
+    } else {
+        fprintf(stderr,"No live cells found (empty archive)\n");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Renderer: grid -> RGB24 (alive=white, dead=black)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1157,10 +1521,13 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Render mode — render .gol archive to RGB24 video (stdout pipe to ffmpeg)
+// Render mode — render .gol archive to raw video (stdout pipe to ffmpeg)
+// pix_fmt: "rgb24" (3 bytes/pixel age-colored, default) or "gray8" (1 byte/pixel 0/255)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int THREADS) {
+static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int THREADS,
+                       const std::string& pix_fmt = "rgb24",
+                       int crop_x=0, int crop_y=0, int crop_w=0, int crop_h=0) {
     omp_set_num_threads(THREADS);
     SET_STDOUT_BINARY();
 
@@ -1174,8 +1541,6 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
     GolFrameReader stream;
     if (!stream.open(gol_path)) return;
 
-    // Age-tracking buffer: same dimensions as bit grid
-    // We allocate one row at a time lazily — for huge grids, don't allocate full age array
     int grid_w, grid_h;
     {
         FILE* f = fopen(gol_path.c_str(), "rb");
@@ -1184,79 +1549,142 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
         grid_w = ru32(hdr+4); grid_h = ru32(hdr+8);
     }
 
-    // Age tracking — we update age cell-by-cell as we stream
-    // Use uint8_t for age (0=dead, 1-127=age, 127+ capped)
-    size_t total_cells = (size_t)grid_w * grid_h;
-    uint8_t* ages = (uint8_t*)calloc(1, total_cells);
-    std::vector<uint8_t> prev_row_bits;
+    // Crop bounds (default to full grid)
+    if (crop_w <= 0 || crop_h <= 0) { crop_x = 0; crop_y = 0; crop_w = grid_w; crop_h = grid_h; }
+    int c_x2 = crop_x + crop_w;
+    int c_y2 = crop_y + crop_h;
+    if (c_x2 > grid_w) c_x2 = grid_w;
+    if (c_y2 > grid_h) c_y2 = grid_h;
+
+    bool mono = (pix_fmt == "gray8");
+    bool monow = (pix_fmt == "monow");
+    int bpp = monow ? 0 : (mono ? 1 : 3); // bytes per pixel (0 = 1-bit packed)
+    int row_bytes = monow ? ((rW + 7) / 8) : (rW * bpp);
+    size_t frame_bytes = monow ? (size_t)((rW * rH + 7) / 8) : ((size_t)rW * rH * bpp);
+
+    // Age tracking only for the crop region (not needed in mono/monow mode)
+    size_t crop_cells = (size_t)crop_w * crop_h;
+    uint8_t* ages = (uint8_t*)calloc(1, (mono || monow) ? 1 : crop_cells);
 
     fprintf(stderr,"=== GoL Render from Archive ===\n");
-    fprintf(stderr,"Archive: %s  Render: %dx%d @ %d fps\n", gol_path.c_str(), rW, rH, FPS);
-    fprintf(stderr,"Grid:    %dx%d  Coverage: %.2f x %.2f cells/pixel\n",
-            grid_w, grid_h, (double)grid_w/rW, (double)grid_h/rH);
+    fprintf(stderr,"Archive: %s  Render: %dx%d @ %d fps  Format: %s\n",
+            gol_path.c_str(), rW, rH, FPS, pix_fmt.c_str());
+    fprintf(stderr,"Grid:    %dx%d  Crop: %d..%d x %d..%d  Coverage: %.2f x %.2f cells/pixel\n",
+            grid_w, grid_h, crop_x, c_y2-1, crop_y, c_x2-1,
+            (double)crop_w/rW, (double)crop_h/rH);
     fprintf(stderr,"\n");
 
     std::vector<uint8_t> frame_buf;
-    size_t frame_bytes = (size_t)rW * rH * 3;
     auto wall0 = std::chrono::high_resolution_clock::now();
     int total_frames = 0;
 
     std::vector<uint8_t> bits;
     uint32_t live_count;
-    // Read gen 0
     if (!stream.read_next(live_count, bits)) {
         free(ages); return;
     }
     total_frames++;
 
-    // Compute ages for gen 0: alive = age 1
-    {
-        long long bp = 0;
-        for (int r = 0; r < grid_h; r++) {
-            for (int c = 0; c < grid_w; c++) {
-                int alive = (bits[bp/8] >> (bp%8)) & 1;
-                ages[r * (size_t)grid_w + c] = alive ? 1 : 0;
-                bp++;
+    if (!mono && !monow) {
+        // Compute ages for gen 0 (crop region only)
+        #pragma omp parallel for
+        for (int r = crop_y; r < c_y2; r++) {
+            size_t row_off = (size_t)r * grid_w;
+            size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
+            for (int c = crop_x; c < c_x2; c++) {
+                int byte_idx = (int)((row_off + c) / 8);
+                int bit_idx  = (int)((row_off + c) % 8);
+                int alive = (bits[byte_idx] >> bit_idx) & 1;
+                ages[crop_row_off + (c - crop_x)] = alive ? 1 : 0;
             }
         }
     }
 
-    // Build age color LUT for render-from-archive (white->yellow->orange->green->blue)
+    // Age color LUT (not used in mono/monow mode)
     uint8_t age_lut_r[129], age_lut_g[129], age_lut_b[129];
-    age_lut_r[0]=age_lut_g[0]=age_lut_b[0]=0;
-    for (int a=1; a<=128; a++) {
-        float t=(a-1)/127.0f;
-        if (t<0.15f)      { float s=t/0.15f; age_lut_r[a]=255;           age_lut_g[a]=255;           age_lut_b[a]=(uint8_t)(255*(1-s)); }
-        else if (t<0.38f) { float s=(t-0.15f)/0.23f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(255*(1-s*0.45f)); age_lut_b[a]=0; }
-        else if (t<0.60f) { float s=(t-0.38f)/0.22f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(140+60*(1-s)); age_lut_b[a]=0; }
-        else if (t<0.78f) { float s=(t-0.60f)/0.18f; age_lut_r[a]=(uint8_t)(255-255*s); age_lut_g[a]=200; age_lut_b[a]=(uint8_t)(60+195*s); }
-        else              { float s=(t-0.78f)/0.22f; age_lut_r[a]=0;    age_lut_g[a]=(uint8_t)(80-60*s); age_lut_b[a]=(uint8_t)(255-175*s); }
+    if (!mono && !monow) {
+        age_lut_r[0]=age_lut_g[0]=age_lut_b[0]=0;
+        for (int a=1; a<=128; a++) {
+            float t=(a-1)/127.0f;
+            if (t<0.15f)      { float s=t/0.15f; age_lut_r[a]=255;           age_lut_g[a]=255;           age_lut_b[a]=(uint8_t)(255*(1-s)); }
+            else if (t<0.38f) { float s=(t-0.15f)/0.23f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(255*(1-s*0.45f)); age_lut_b[a]=0; }
+            else if (t<0.60f) { float s=(t-0.38f)/0.22f; age_lut_r[a]=255;  age_lut_g[a]=(uint8_t)(140+60*(1-s)); age_lut_b[a]=0; }
+            else if (t<0.78f) { float s=(t-0.60f)/0.18f; age_lut_r[a]=(uint8_t)(255-255*s); age_lut_g[a]=200; age_lut_b[a]=(uint8_t)(60+195*s); }
+            else              { float s=(t-0.78f)/0.22f; age_lut_r[a]=0;    age_lut_g[a]=(uint8_t)(80-60*s); age_lut_b[a]=(uint8_t)(255-175*s); }
+        }
     }
 
-    // Helper: render row range with age coloring
-    auto render_row = [&](int py, const uint8_t* bits, const uint8_t* ages, uint8_t* out) {
-        int gr0=(int)((double)py*grid_h/rH), gr1=(int)((double)(py+1)*grid_h/rH);
-        if (gr1<=gr0) gr1=gr0+1; if (gr1>grid_h) gr1=grid_h;
-        for (int px=0; px<rW; px++) {
-            int gc0=(int)((double)px*grid_w/rW), gc1=(int)((double)(px+1)*grid_w/rW);
-            if (gc1<=gc0) gc1=gc0+1; if (gc1>grid_w) gc1=grid_w;
-            uint8_t max_age=0;
-            for (int gr=gr0; gr<gr1&&max_age<128; gr++) {
-                for (int gc=gc0; gc<gc1; gc++) {
-                    size_t idx = (size_t)gr*grid_w+gc;
-                    uint8_t a = ages[idx];
-                    if (a>max_age) max_age=a;
+    // Detect 1:1 mode (each cell maps to exactly 1 pixel, with black padding)
+    bool is_1to1 = (crop_w <= rW && crop_h <= rH);
+
+    // Helper: render output row from crop region
+    auto render_row = [&](int py, const uint8_t* src, uint8_t* out) {
+        if (monow) {
+            // Monow: 1 bit per pixel, MSB-first packed (ffmpeg pixel_format=monow)
+            // Internal grid is LSB-first, so we bit-reverse each output byte.
+            memset(out, 0, (size_t)((rW + 7) / 8));
+            if (py < crop_h) {
+                int abs_r = crop_y + py;
+                size_t row_bit_off = (size_t)abs_r * grid_w;
+                int out_row_bytes = (rW + 7) / 8;
+                for (int px = 0; px < crop_w; px++) {
+                    int abs_c = crop_x + px;
+                    size_t idx = row_bit_off + abs_c;
+                    int alive = (bits[idx/8] >> (idx%8)) & 1;
+                    if (alive) out[px / 8] |= (uint8_t)(0x80 >> (px % 8));
                 }
             }
-            out[px*3]=age_lut_r[max_age]; out[px*3+1]=age_lut_g[max_age]; out[px*3+2]=age_lut_b[max_age];
+        } else if (mono) {
+            // Mono: 1 byte per pixel, 0 = dead, 255 = alive
+            memset(out, 0, (size_t)rW);
+            if (py < crop_h) {
+                int abs_r = crop_y + py;
+                size_t row_bit_off = (size_t)abs_r * grid_w;
+                for (int px = 0; px < crop_w; px++) {
+                    int abs_c = crop_x + px;
+                    size_t idx = row_bit_off + abs_c;
+                    int alive = (bits[idx/8] >> (idx%8)) & 1;
+                    out[px] = alive ? 255 : 0;
+                }
+            }
+        } else if (is_1to1) {
+            // 1:1 direct mapping — each cell = 1 pixel, black padding outside crop
+            memset(out, 0, (size_t)rW * 3);
+            if (py < crop_h) {
+                size_t crop_base = (size_t)py * crop_w;
+                for (int px = 0; px < crop_w; px++) {
+                    uint8_t a = src[crop_base + px];
+                    out[px * 3]     = age_lut_r[a];
+                    out[px * 3 + 1] = age_lut_g[a];
+                    out[px * 3 + 2] = age_lut_b[a];
+                }
+            }
+        } else {
+            // Scaling: find max age in the mapped cell region for each pixel
+            int gr0=crop_y+(int)((double)py*crop_h/rH), gr1=crop_y+(int)((double)(py+1)*crop_h/rH);
+            if (gr1<=gr0) gr1=gr0+1; if (gr1>c_y2) gr1=c_y2;
+            for (int px=0; px<rW; px++) {
+                int gc0=crop_x+(int)((double)px*crop_w/rW), gc1=crop_x+(int)((double)(px+1)*crop_w/rW);
+                if (gc1<=gc0) gc1=gc0+1; if (gc1>c_x2) gc1=c_x2;
+                uint8_t max_age=0;
+                for (int gr=gr0; gr<gr1&&max_age<128; gr++) {
+                    size_t crop_base = (size_t)(gr-crop_y) * crop_w;
+                    for (int gc=gc0; gc<gc1; gc++) {
+                        uint8_t a = src[crop_base + (gc-crop_x)];
+                        if (a>max_age) max_age=a;
+                    }
+                }
+                out[px*3]=age_lut_r[max_age]; out[px*3+1]=age_lut_g[max_age]; out[px*3+2]=age_lut_b[max_age];
+            }
         }
     };
 
     // Render gen 0
     if (rW>0 && rH>0) {
         frame_buf.resize(frame_bytes);
+        #pragma omp parallel for
         for (int py=0; py<rH; py++)
-            render_row(py, bits.data(), ages, frame_buf.data()+py*rW*3);
+            render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
         fwrite(frame_buf.data(), 1, frame_bytes, stdout);
     }
 
@@ -1264,22 +1692,29 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
         if (!stream.read_next(live_count, bits)) break;
         total_frames++;
 
-        // Update ages: XOR with prev bits tells us births and deaths
-        long long bp = 0;
-        for (size_t i = 0; i < total_cells; i++) {
-            int alive = (bits[bp/8] >> (bp%8)) & 1;
-            if (alive) {
-                ages[i] = (ages[i] >= 127) ? 127 : ages[i] + 1;
-            } else {
-                ages[i] = 0;
+        if (!mono && !monow) {
+            // Update ages for crop region only
+            #pragma omp parallel for
+            for (int r = crop_y; r < c_y2; r++) {
+                size_t row_off = (size_t)r * grid_w;
+                size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
+                for (int c = crop_x; c < c_x2; c++) {
+                    size_t idx = row_off + c;
+                    int alive = (bits[idx/8] >> (idx%8)) & 1;
+                    size_t aidx = crop_row_off + (c - crop_x);
+                    if (alive) {
+                        ages[aidx] = (ages[aidx] >= 127) ? 127 : ages[aidx] + 1;
+                    } else {
+                        ages[aidx] = 0;
+                    }
+                }
             }
-            bp++;
         }
 
-        // Render using live bits + ages
         if (rW>0 && rH>0) {
+            #pragma omp parallel for
             for (int py=0; py<rH; py++)
-                render_row(py, bits.data(), ages, frame_buf.data()+py*rW*3);
+                render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
             fwrite(frame_buf.data(), 1, frame_bytes, stdout);
         }
 
@@ -1303,15 +1738,46 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
 // Sim mode (config-driven, stagnation detection, archive)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int run_sim(const Config& cfg) {
+static int run_sim(Config cfg) {
     omp_set_num_threads(cfg.threads);
 
+#ifdef _WIN32
+    SetConsoleCtrlHandler(ctrl_handler, TRUE);
+#else
+    struct sigaction sa;
+    sa.sa_handler = ctrl_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+#endif
+
     if (cfg.has_video()) SET_STDOUT_BINARY();
+
+    if (!cfg.resume_file.empty()) {
+        FILE* rf = fopen(cfg.resume_file.c_str(), "rb");
+        if (!rf) { fprintf(stderr,"Cannot open resume file '%s'\n",cfg.resume_file.c_str()); return 1; }
+        uint8_t hdr[64];
+        if (fread(hdr,1,64,rf)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+            fprintf(stderr,"Not a valid .gol file\n"); fclose(rf); return 1;
+        }
+        auto ru32=[&](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+        cfg.grid_w = (int)ru32(hdr+4);
+        cfg.grid_h = (int)ru32(hdr+8);
+        cfg.rule_B  = hdr[20];
+        cfg.rule_S  = hdr[24];
+        fclose(rf);
+        fprintf(stderr,"=== Resuming from '%s'\n",cfg.resume_file.c_str());
+        if (cfg.archive_file.empty()) cfg.archive_file = cfg.resume_file;
+    }
 
     fprintf(stderr,"=== GoL Simulation ===\n");
     fprintf(stderr,"Grid:    %dx%d\n",cfg.grid_w,cfg.grid_h);
     fprintf(stderr,"Rules:   %s\n",rules_str(cfg.rule_B,cfg.rule_S).c_str());
-    fprintf(stderr,"Max:     %d gens\n",cfg.max_gens);
+    if (cfg.max_gens>0)
+        fprintf(stderr,"Max:     %d gens\n",cfg.max_gens);
+    else
+        fprintf(stderr,"Max:     unlimited (run to stagnation)\n");
     fprintf(stderr,"Stag:    %s  still=%s  cycle=%s  window=%d  extinct=%s\n",
             cfg.stag_enable?"on":"off",
             cfg.stag_still?"on":"off",
@@ -1322,30 +1788,44 @@ static int run_sim(const Config& cfg) {
         fprintf(stderr,"Video:   %dx%d @ %d fps\n",cfg.video_w,cfg.video_h,cfg.video_fps);
     if (cfg.has_archive())
         fprintf(stderr,"Archive: %s (every %d gen)\n",cfg.archive_file.c_str(),cfg.archive_every);
+    if (cfg.stop_at_free_gb > 0)
+        fprintf(stderr,"Stop:    stop if archive drive free space <= %llu GB\n",
+                (unsigned long long)cfg.stop_at_free_gb);
     fprintf(stderr,"Threads: %d\n\n",cfg.threads);
 
     Grid A(cfg.grid_w,cfg.grid_h), B(cfg.grid_w,cfg.grid_h);
 
-    if (cfg.has_seeds()) {
-        for (auto& seed : cfg.seeds) {
-            bool ok;
-            if (seed.is_file) ok = load_state(A, seed.name, seed.cx, seed.cy);
-            else ok = load_named_pattern(A, seed.name, seed.cx, seed.cy);
-            if (!ok) return 1;
+    GolArchive archive;
+    int resume_gen = 0;
+
+    if (cfg.has_archive()) {
+        if (!cfg.resume_file.empty()) {
+            // Single scan: open_append decodes all frames, loads last into Grid A,
+            // and sets up prev_bits for continued delta compression.
+            if (!archive.open_append(cfg.archive_file, resume_gen, &A)) return 1;
+            fprintf(stderr,"Resumed at gen %d (live: %lld)\n",resume_gen, count_live(A));
+        } else {
+            archive.open(cfg.archive_file, cfg.grid_w, cfg.grid_h,
+                         cfg.rule_B, cfg.rule_S, (uint32_t)cfg.video_fps);
         }
-    } else {
-        random_fill(A, cfg.random_density, cfg.random_seed);
+    }
+
+    if (resume_gen == 0) {
+        if (cfg.has_seeds()) {
+            for (auto& seed : cfg.seeds) {
+                bool ok;
+                if (seed.is_file) ok = load_state(A, seed.name, seed.cx, seed.cy);
+                else ok = load_named_pattern(A, seed.name, seed.cx, seed.cy);
+                if (!ok) return 1;
+            }
+        } else {
+            random_fill(A, cfg.random_density, cfg.random_seed);
+        }
     }
 
     fprintf(stderr,"Initial live: %lld (%.2f%%)\n",
             count_live(A), 100.0*count_live(A)/((long long)cfg.grid_w*cfg.grid_h));
     sync_borders(A);
-
-    GolArchive archive;
-    if (cfg.has_archive()) {
-        archive.open(cfg.archive_file, cfg.grid_w, cfg.grid_h,
-                     cfg.rule_B, cfg.rule_S, (uint32_t)cfg.video_fps);
-    }
 
     StagnationDetector stag(cfg);
     StagnationResult stag_result;
@@ -1355,15 +1835,41 @@ static int run_sim(const Config& cfg) {
     auto last_report = std::chrono::high_resolution_clock::now();
     auto t0 = last_report;
 
-    if (cfg.has_archive() && cfg.archive_every > 0)
+    if (resume_gen == 0 && cfg.has_archive() && cfg.archive_every > 0)
         archive.write_frame(0, count_live(A), A);
     if (cfg.has_video()) {
         render_frame(A,cfg.video_w,cfg.video_h,frame_buf);
         fwrite(frame_buf.data(),1,frame_bytes,stdout);
     }
 
-    int final_gen = cfg.max_gens;
-    for (int gen=1; gen<=cfg.max_gens; gen++) {
+    long long max_gen_limit = (cfg.max_gens>0) ? (long long)cfg.max_gens : 2000000000;
+    int final_gen = (cfg.max_gens>0) ? cfg.max_gens : 0;
+    int start_gen = (resume_gen > 0) ? resume_gen : 1;
+    int last_disk_check = 0;
+
+    for (int gen = start_gen; gen <= max_gen_limit; gen++) {
+        if (g_stop_requested) {
+            fprintf(stderr, "\nStopped by user at gen %d\n", gen);
+            final_gen = gen;
+            break;
+        }
+
+        if (gen - last_disk_check >= 1000) {
+            last_disk_check = gen;
+            if (archive.has_error()) {
+                fprintf(stderr, "\nArchive write error — stopping at gen %d\n", gen);
+                final_gen = gen;
+                break;
+            }
+            if (cfg.stop_at_free_gb > 0 && cfg.has_archive() &&
+                !enough_disk_space(cfg.archive_file, cfg.stop_at_free_gb * 1024ULL)) {
+                fprintf(stderr, "\nDrive space low (<= %llu GB) — stopping at gen %d\n",
+                        (unsigned long long)cfg.stop_at_free_gb, gen);
+                final_gen = gen;
+                break;
+            }
+        }
+
         StepResult res = step_rules(A,B,cfg.rule_B,cfg.rule_S);
         sync_borders(B);
         std::swap(A.bits,B.bits);
@@ -1391,10 +1897,14 @@ static int run_sim(const Config& cfg) {
         }
 
         auto now=std::chrono::high_resolution_clock::now();
-        if (std::chrono::duration<double>(now-last_report).count()>=1.0||gen==cfg.max_gens) {
+        if (std::chrono::duration<double>(now-last_report).count()>=1.0) {
             double elapsed=std::chrono::duration<double>(now-t0).count();
-            fprintf(stderr,"  Gen %6d/%d  %7.1f GPS  live: %lld        \r",
-                    gen,cfg.max_gens,(double)gen/elapsed,(long long)res.live_count);
+            if (cfg.max_gens>0)
+                fprintf(stderr,"  Gen %6d/%d  %7.1f GPS  live: %lld        \r",
+                        gen,cfg.max_gens,(double)gen/elapsed,(long long)res.live_count);
+            else
+                fprintf(stderr,"  Gen %6d  %7.1f GPS  live: %lld        \r",
+                        gen,(double)gen/elapsed,(long long)res.live_count);
             last_report=now;
         }
     }
@@ -1417,7 +1927,11 @@ static int run_sim(const Config& cfg) {
     fprintf(stderr,"Gens: %d  Time: %.3fs  GPS: %.1f\n",
             final_gen,elapsed,(double)final_gen/elapsed);
 
-    if (stag_result.triggered) {
+    if (g_stop_requested) {
+        fprintf(stderr,"Stop: user requested (Ctrl+C) at gen %d\n", final_gen);
+    } else if (archive.has_error()) {
+        fprintf(stderr,"Stop: archive write error at gen %d\n", final_gen);
+    } else if (stag_result.triggered) {
         if (stag_result.period == -1)
             fprintf(stderr,"Stop: Extinction (all cells dead) at gen %d\n",stag_result.detect_gen);
         else if (stag_result.period == 1)
@@ -1425,6 +1939,8 @@ static int run_sim(const Config& cfg) {
         else
             fprintf(stderr,"Stop: Cycle period %d, detected at gen %d (cycle starts gen %d)\n",
                     stag_result.period,stag_result.detect_gen,stag_result.cycle_start);
+    } else if (cfg.stop_at_free_gb > 0 && !enough_disk_space(cfg.archive_file, cfg.stop_at_free_gb * 1024ULL)) {
+        fprintf(stderr,"Stop: drive space threshold reached at gen %d\n", final_gen);
     } else {
         fprintf(stderr,"Stop: max_gens reached (no stagnation detected in window=%d)\n",
                 cfg.cycle_window);
@@ -1434,6 +1950,542 @@ static int run_sim(const Config& cfg) {
         fprintf(stderr,"Archive: %s  (%d frames)\n",cfg.archive_file.c_str(),archive.gen_count);
 
     return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BMP writer — single-frame render to viewable image (no ffmpeg needed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool write_bmp(const std::string& path, const uint8_t* pixels, int w, int h, int bpp) {
+    int pal_entries = (bpp == 24) ? 0 : (bpp == 8 ? 256 : 2);
+    int pal_size = pal_entries * 4;
+    int row_size = ((w * bpp + 31) / 32) * 4;
+    int data_size = row_size * h;
+    int hdr_size = 14 + 40 + pal_size;
+    std::vector<uint8_t> bmp(hdr_size + data_size);
+
+    auto w32 = [](uint8_t* p, uint32_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF; };
+    auto w16 = [](uint8_t* p, uint16_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; };
+
+    bmp[0]='B'; bmp[1]='M';
+    w32(&bmp[2],  hdr_size + data_size);
+    w32(&bmp[10], hdr_size);
+    w32(&bmp[14], 40);
+    w32(&bmp[18], w);
+    w32(&bmp[22], h);
+    w16(&bmp[26], 1);
+    w16(&bmp[28], (uint16_t)bpp);
+    w32(&bmp[34], data_size);
+    w32(&bmp[38], 2835);
+    w32(&bmp[42], 2835);
+    w32(&bmp[46], (uint32_t)pal_entries);
+
+    if (bpp == 8)
+        for (int i = 0; i < 256; i++) { int o = 54 + i*4; bmp[o]=bmp[o+1]=bmp[o+2]=(uint8_t)i; }
+    else if (bpp == 1)
+        { bmp[54]=bmp[55]=bmp[56]=0; bmp[58]=bmp[59]=bmp[60]=255; }
+
+    int src_row = bpp == 24 ? w*3 : (bpp == 8 ? w : (w+7)/8);
+    for (int y = 0; y < h; y++) {
+        int dst = hdr_size + (h-1-y) * row_size;
+        int src = y * src_row;
+        if (bpp == 24)
+            for (int x = 0; x < w; x++) {
+                bmp[dst + x*3]   = pixels[src + x*3 + 2];
+                bmp[dst + x*3+1] = pixels[src + x*3 + 1];
+                bmp[dst + x*3+2] = pixels[src + x*3];
+            }
+        else
+            memcpy(&bmp[dst], &pixels[src], src_row);
+    }
+
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "Cannot write '%s'\n", path.c_str()); return false; }
+    fwrite(bmp.data(), 1, bmp.size(), f);
+    fclose(f);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Export coordinates: dump live cell (x,y) as uint16 LE pairs to a binary file
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void run_export_coords(const std::string& gol_path, int gen, const std::string& out_path) {
+    // Read header
+    FILE* f = fopen(gol_path.c_str(), "rb");
+    if (!f) { fprintf(stderr, "Cannot open '%s'\n", gol_path.c_str()); return; }
+    uint8_t hdr[64];
+    if (fread(hdr,1,64,f)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+        fprintf(stderr, "Not a valid .gol file\n"); fclose(f); return;
+    }
+    auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+    int W = ru32(hdr+4), H = ru32(hdr+8);
+    fclose(f);
+
+    Grid g(W, H);
+    if (!load_gol_frame(g, gol_path, gen)) return;
+
+    FILE* out = fopen(out_path.c_str(), "wb");
+    if (!out) { fprintf(stderr, "Cannot write '%s'\n", out_path.c_str()); return; }
+
+    int count = 0;
+    int rw = (W + 63) / 64;
+    uint16_t buf[2];
+    for (int r = 0; r < H; r++) {
+        const uint64_t* row = g.brow(r);
+        for (int w = 0; w < rw; w++) {
+            uint64_t word = row[w];
+            if (!word) continue;
+            int base = w * 64;
+            while (word) {
+                int bit = __builtin_ctzll(word);
+                buf[0] = (uint16_t)(base + bit);
+                buf[1] = (uint16_t)r;
+                fwrite(buf, 1, 4, out);
+                count++;
+                word &= word - 1; // clear lowest set bit
+            }
+        }
+    }
+    fclose(out);
+    fprintf(stderr, "Exported %d live cells from gen %d to '%s'\n", count, gen, out_path.c_str());
+}
+
+// Single-frame snapshot: render a specific gen from .gol or .cells to BMP
+//   gol snapshot <file> <gen> <out.bmp> <rW> <rH> [rgb24|gray8|monow] [cx cy cw ch]
+//   If file is .cells, gen is ignored (just load and render).
+static void run_snapshot(const std::string& input, int gen, const std::string& output,
+                         int rW, int rH, const std::string& pix_fmt,
+                         int crop_x, int crop_y, int crop_w, int crop_h)
+{
+    bool is_gol = (input.size() >= 4 && input.substr(input.size()-4) == ".gol");
+    int grid_w, grid_h;
+    std::vector<uint8_t> bits; // raw LSB-first bitmap
+    size_t nbytes = 0;
+
+    if (is_gol) {
+        // Read header
+        FILE* f = fopen(input.c_str(), "rb");
+        if (!f) { fprintf(stderr, "Cannot open '%s'\n", input.c_str()); return; }
+        uint8_t hdr[64];
+        if (fread(hdr,1,64,f)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+            fprintf(stderr, "Not a valid .gol file\n"); fclose(f); return;
+        }
+        auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+        grid_w = ru32(hdr+4); grid_h = ru32(hdr+8);
+        fclose(f);
+
+        // Load gen into Grid, then extract bitmap
+        Grid g(grid_w, grid_h);
+        if (!load_gol_frame(g, input, gen)) return;
+
+        // Extract bitmap from Grid
+        nbytes = (size_t)((grid_w + 7) / 8) * grid_h;
+        bits.resize(nbytes);
+        int rw_bytes = (grid_w + 7) / 8;
+        for (int r = 0; r < grid_h; r++) {
+            const uint64_t* row = g.brow(r);
+            for (int b = 0; b < rw_bytes; b++) {
+                int off8 = b * 8;
+                uint8_t byte = 0;
+                int remain = grid_w - off8;
+                int bits_in_byte = remain < 8 ? remain : 8;
+                for (int k = 0; k < bits_in_byte; k++)
+                    byte |= (uint8_t)(((row[(off8+k)/64] >> ((off8+k)%64)) & 1) << k);
+                bits[(size_t)r * rw_bytes + b] = byte;
+            }
+        }
+    } else {
+        // .cells file — load into Grid sized to contain the pattern centered
+        Grid g(0,0);
+        // First, scan pattern size
+        FILE* f = fopen(input.c_str(), "r");
+        if (!f) { fprintf(stderr, "Cannot open '%s'\n", input.c_str()); return; }
+        std::vector<std::string> lines;
+        char buf[65536];
+        while (fgets(buf,sizeof(buf),f)) {
+            if (buf[0]=='!'||buf[0]=='#') continue;
+            int len=(int)strlen(buf);
+            while (len>0&&(buf[len-1]=='\r'||buf[len-1]=='\n')) buf[--len]=0;
+            if (len>0) lines.emplace_back(buf);
+        }
+        fclose(f);
+        int pat_w=0, pat_h=(int)lines.size();
+        for (auto& l:lines) pat_w=std::max(pat_w,(int)l.size());
+        // size grid so pattern centered with some margin
+        grid_w = (pat_w + 63) & ~63;
+        if (grid_w < 64) grid_w = 64;
+        grid_h = pat_h * 2;
+        if (grid_h < 64) grid_h = 64;
+        int cx = (grid_w - pat_w) / 2;
+        int cy = (grid_h - pat_h) / 2;
+
+        if (grid_w > rW || grid_h > rH) {
+            fprintf(stderr,"Snapshot render only supports cells-to-pixel mapping via crop\n");
+            fprintf(stderr,"Using grid %dx%d (pattern %dx%d centered)\n",grid_w,grid_h,pat_w,pat_h);
+        }
+
+        g = Grid(grid_w, grid_h);
+        load_cells(g, input, cx, cy);
+
+        nbytes = (size_t)((grid_w + 7) / 8) * grid_h;
+        bits.resize(nbytes);
+        int rw_bytes = (grid_w + 7) / 8;
+        for (int r = 0; r < grid_h; r++) {
+            const uint64_t* row = g.brow(r);
+            for (int b = 0; b < rw_bytes; b++) {
+                int off8 = b * 8;
+                uint8_t byte = 0;
+                int remain = grid_w - off8;
+                int bits_in_byte = remain < 8 ? remain : 8;
+                for (int k = 0; k < bits_in_byte; k++)
+                    byte |= (uint8_t)(((row[(off8+k)/64] >> ((off8+k)%64)) & 1) << k);
+                bits[(size_t)r * rw_bytes + b] = byte;
+            }
+        }
+    }
+
+    // Crop defaults
+    if (crop_w <= 0 || crop_h <= 0) { crop_x = 0; crop_y = 0; crop_w = grid_w; crop_h = grid_h; }
+    int c_x2 = crop_x + crop_w; if (c_x2 > grid_w) c_x2 = grid_w;
+    int c_y2 = crop_y + crop_h; if (c_y2 > grid_h) c_y2 = grid_h;
+
+    bool mono = (pix_fmt == "gray8");
+    bool monow = (pix_fmt == "monow");
+    int bpp = monow ? 0 : (mono ? 1 : 3);
+    int row_bytes = monow ? ((rW + 7) / 8) : (rW * bpp);
+    size_t frame_bytes = monow ? (size_t)((rW * rH + 7) / 8) : ((size_t)rW * rH * bpp);
+
+    std::vector<uint8_t> frame_buf(frame_bytes);
+
+    // Render row helper (same as run_render)
+    auto render_row = [&](int py, const uint8_t* src, uint8_t* out) {
+        if (monow) {
+            memset(out, 0, (size_t)((rW + 7) / 8));
+            if (py < (c_y2 - crop_y)) {
+                int abs_r = crop_y + py;
+                size_t row_bit_off = (size_t)abs_r * grid_w;
+                for (int px = 0; px < crop_w && px < rW; px++) {
+                    int abs_c = crop_x + px;
+                    size_t idx = row_bit_off + abs_c;
+                    if ((bits[idx/8] >> (idx%8)) & 1)
+                        out[px / 8] |= (uint8_t)(0x80 >> (px % 8));
+                }
+            }
+        } else if (mono) {
+            memset(out, 0, (size_t)rW);
+            if (py < (c_y2 - crop_y)) {
+                int abs_r = crop_y + py;
+                size_t row_bit_off = (size_t)abs_r * grid_w;
+                for (int px = 0; px < crop_w && px < rW; px++) {
+                    int abs_c = crop_x + px;
+                    if ((bits[(row_bit_off + abs_c)/8] >> ((row_bit_off + abs_c)%8)) & 1)
+                        out[px] = 255;
+                }
+            }
+        } else {
+            memset(out, 0, (size_t)rW * 3);
+            if (py < (c_y2 - crop_y)) {
+                int abs_r = crop_y + py;
+                size_t row_bit_off = (size_t)abs_r * grid_w;
+                for (int px = 0; px < crop_w && px < rW; px++) {
+                    int abs_c = crop_x + px;
+                    int alive = (bits[(row_bit_off + abs_c)/8] >> ((row_bit_off + abs_c)%8)) & 1;
+                    out[px*3] = out[px*3+1] = out[px*3+2] = alive ? 255 : 0;
+                }
+            }
+        }
+    };
+
+    #pragma omp parallel for
+    for (int py = 0; py < rH; py++)
+        render_row(py, nullptr, frame_buf.data() + (size_t)py * row_bytes);
+
+    fprintf(stderr,"Snapshot: %s gen %d -> %s  %dx%d %s\n",
+            input.c_str(), gen, output.c_str(), rW, rH, pix_fmt.c_str());
+    fprintf(stderr,"Grid: %dx%d  Crop: %d..%d x %d..%d\n",
+            grid_w, grid_h, crop_x, c_x2-1, crop_y, c_y2-1);
+
+    write_bmp(output, frame_buf.data(), rW, rH, bpp == 0 ? 1 : bpp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serve mode — HTTP server streaming live cell coords to an HTML viewer
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::vector<uint8_t> extract_coords_bin(const uint8_t* bits, int W, int H) {
+    int rw = (W + 63) / 64;
+    int row_bytes = (W + 7) / 8;
+    // Pre-allocate room for ~200K cells (800KB)
+    std::vector<uint8_t> out(4, 0);
+    out.reserve(800004);
+
+    for (int r = 0; r < H; r++) {
+        const uint64_t* row = (const uint64_t*)(bits + (size_t)r * row_bytes);
+        for (int w = 0; w < rw; w++) {
+            uint64_t word = row[w];
+            while (word) {
+                int bit = __builtin_ctzll(word);
+                uint16_t x = (uint16_t)(w * 64 + bit);
+                uint16_t y = (uint16_t)r;
+                out.push_back((uint8_t)(x & 0xFF));
+                out.push_back((uint8_t)(x >> 8));
+                out.push_back((uint8_t)(y & 0xFF));
+                out.push_back((uint8_t)(y >> 8));
+                word &= word - 1;
+            }
+        }
+    }
+    uint32_t count = (uint32_t)((out.size() - 4) / 4);
+    out[0] = count & 0xFF; out[1] = (count>>8)&0xFF;
+    out[2] = (count>>16)&0xFF; out[3] = (count>>24)&0xFF;
+    return out;
+}
+
+static void send_http(SOCKET client, const std::vector<uint8_t>& body,
+                      const std::string& content_type="application/octet-stream")
+{
+    std::string header =
+        "HTTP/1.1 200 OK\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Type: " + content_type + "\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n\r\n";
+    send(client, header.data(), (int)header.size(), 0);
+    send(client, (const char*)body.data(), (int)body.size(), 0);
+}
+
+static void send_http_str(SOCKET client, const std::string& body) {
+    std::vector<uint8_t> v(body.begin(), body.end());
+    send_http(client, v, "text/plain");
+}
+
+static void run_serve(const std::string& gol_path, int port) {
+    // Read header
+    FILE* f = fopen(gol_path.c_str(), "rb");
+    if (!f) { fprintf(stderr,"Cannot open '%s'\n",gol_path.c_str()); return; }
+    uint8_t hdr[64];
+    if (fread(hdr,1,64,f)!=64||hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+        fprintf(stderr,"Not a valid .gol file\n"); fclose(f); return;
+    }
+    auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+    int W = ru32(hdr+4), H = ru32(hdr+8);
+    uint8_t compression = hdr[36];
+    size_t nbytes = (size_t)((size_t)W*H+7)/8;
+    int row_bytes = (W + 7) / 8;
+
+    // Build frame index: scan headers quickly (no decompress)
+    struct Entry { long long offset; };
+    std::vector<Entry> idx;
+    idx.reserve(600000);
+    long long off = 64;
+    while (true) {
+        uint8_t fhdr[21];
+        if (fread(fhdr,1,21,f)!=21) break;
+        uint32_t csize = ru32(fhdr+17);
+        if (csize>100*1024*1024) break;
+        idx.push_back({off});
+        off += 21 + csize;
+        if (fseek(f, (long)csize, SEEK_CUR)!=0) break;
+    }
+    fclose(f);
+    int total_frames = (int)idx.size();
+    fprintf(stderr,"Serving %s  %dx%d  %d frames\n",gol_path.c_str(),W,H,total_frames);
+
+    // Thread-safe decoder state
+    struct CacheSlot { int gen; std::vector<uint8_t> data; bool active; };
+    static const int CACHE_CAP = 2000;
+    std::vector<uint8_t> prev_bits(nbytes, 0);
+    std::vector<uint8_t> cur_bits(nbytes, 0);
+    std::vector<CacheSlot> cache(CACHE_CAP);
+    int decoder_gen = -1;
+    std::mutex cache_mtx;
+    std::condition_variable cache_cv;
+
+    // Background decode thread — decodes all frames sequentially
+    std::thread bg([&]() {
+        FILE* f = fopen(gol_path.c_str(), "rb");
+        if (!f) { fprintf(stderr,"Background decoder: cannot open file\n"); return; }
+        fseek(f, 64, SEEK_SET);
+        bool first_frame = true;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int gen = 0; gen < total_frames; gen++) {
+            uint8_t fhdr[21];
+            if (fread(fhdr,1,21,f)!=21) break;
+            uint32_t csize=ru32(fhdr+17), usize=ru32(fhdr+13);
+            std::vector<uint8_t> cdata(csize);
+            if (fread(cdata.data(),1,csize,f)!=csize) break;
+
+            uint8_t* sparse=nullptr;
+            if (!zstd_decompress(cdata.data(),csize,&sparse,usize)) { free(sparse); break; }
+            size_t dn=0; uint8_t* dec=block_sparse_decode(sparse,usize,nbytes,&dn);
+            free(sparse);
+            if (!dec) break;
+
+            std::unique_lock<std::mutex> lock(cache_mtx);
+            size_t nw=nbytes/8;
+            uint64_t* c64=(uint64_t*)cur_bits.data();
+            uint64_t* p64=(uint64_t*)prev_bits.data();
+            const uint64_t* d64=(const uint64_t*)dec;
+            int row_words=(W+63)/64;
+
+            // Combined XOR + memcpy + extract in one pass
+            std::vector<uint8_t> coords(4,0);
+            coords.reserve(800004);
+            uint32_t count=0;
+            if (first_frame || gen==0) {
+                for (size_t i=0;i<nw;i++) {
+                    uint64_t w=d64[i];
+                    c64[i]=w; p64[i]=w;
+                    if (!w) continue;
+                    int y=(int)(i/row_words);
+                    int bx=(int)(i%row_words)*64;
+                    do {
+                        int b=__builtin_ctzll(w);
+                        uint16_t x=(uint16_t)(bx+b), y16=(uint16_t)y;
+                        coords.push_back(x&0xFF);coords.push_back(x>>8);
+                        coords.push_back(y16&0xFF);coords.push_back(y16>>8);
+                        count++;
+                        w&=w-1;
+                    } while(w);
+                }
+                first_frame=false;
+            } else {
+                for (size_t i=0;i<nw;i++) {
+                    uint64_t w=d64[i]^p64[i];
+                    c64[i]=w; p64[i]=w;
+                    if (!w) continue;
+                    int y=(int)(i/row_words);
+                    int bx=(int)(i%row_words)*64;
+                    do {
+                        int b=__builtin_ctzll(w);
+                        uint16_t x=(uint16_t)(bx+b), y16=(uint16_t)y;
+                        coords.push_back(x&0xFF);coords.push_back(x>>8);
+                        coords.push_back(y16&0xFF);coords.push_back(y16>>8);
+                        count++;
+                        w&=w-1;
+                    } while(w);
+                }
+            }
+            // Handle remaining bytes (non-64-bit-aligned tail)
+            for (size_t i=nw*8;i<nbytes;i++) {
+                uint8_t r=dec[i]^(first_frame?0:prev_bits[i]);
+                cur_bits[i]=r; prev_bits[i]=r;
+                if (!r) continue;
+                int gp=(int)i*8;
+                int y=gp/W, x=gp%W;
+                uint16_t x16=(uint16_t)x,y16=(uint16_t)y;
+                coords.push_back(x16&0xFF);coords.push_back(x16>>8);
+                coords.push_back(y16&0xFF);coords.push_back(y16>>8);
+                count++;
+            }
+            coords[0]=count&0xFF;coords[1]=(count>>8)&0xFF;
+            coords[2]=(count>>16)&0xFF;coords[3]=(count>>24)&0xFF;
+            free(dec);
+            int slot = gen % CACHE_CAP;
+            cache[slot].gen = gen;
+            cache[slot].data = std::move(coords);
+            cache[slot].active = true;
+            decoder_gen = gen;
+            lock.unlock();
+            cache_cv.notify_one();
+
+            if (gen % 10000 == 0) {
+                auto t1 = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration<double,std::milli>(t1-t0).count();
+                fprintf(stderr,"  Decoded gen %d / %d  (%.1fms total)\r", gen, total_frames, ms);
+            }
+        }
+        fclose(f);
+        fprintf(stderr,"\nBackground decode complete (%d frames)\n", total_frames);
+    });
+    bg.detach();
+
+    // get_gen_data: read from cache (background thread does the decode)
+    auto get_gen_data = [&](int gen) -> const std::vector<uint8_t>* {
+        std::unique_lock<std::mutex> lock(cache_mtx);
+        // Wait until this gen is decoded
+        cache_cv.wait(lock, [&]() { return decoder_gen >= gen || decoder_gen >= total_frames-1; });
+        int slot = gen % CACHE_CAP;
+        if (cache[slot].active && cache[slot].gen == gen)
+            return &cache[slot].data;
+        return nullptr;
+    };
+
+    // Start HTTP server
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
+    SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server == INVALID_SOCKET) { fprintf(stderr,"Socket creation failed\n"); return; }
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((unsigned short)port);
+    if (bind(server, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr,"Bind failed on port %d\n", port); return;
+    }
+    listen(server, 8);
+    fprintf(stderr,"Server listening on http://localhost:%d\n", port);
+    fprintf(stderr,"Open the HTML viewer or use 'go' mode\n\n");
+
+    char req_buf[65536];
+    while (true) {
+        SOCKET client = accept(server, NULL, NULL);
+        if (client == INVALID_SOCKET) continue;
+        int n = recv(client, req_buf, sizeof(req_buf)-1, 0);
+        if (n <= 0) { closesocket(client); continue; }
+        req_buf[n] = 0;
+
+        // Parse method and path
+        std::string req(req_buf);
+        auto space1 = req.find(' ');
+        if (space1 == std::string::npos) { closesocket(client); continue; }
+        auto space2 = req.find(' ', space1+1);
+        if (space2 == std::string::npos) { closesocket(client); continue; }
+        std::string path = req.substr(space1+1, space2-space1-1);
+
+        if (path == "/info") {
+            char json[256];
+            snprintf(json, sizeof(json),
+                "{\"w\":%d,\"h\":%d,\"frames\":%d}\n", W, H, total_frames);
+            send_http_str(client, json);
+        } else if (path == "/" || path == "/serve.html") {
+            // Serve the HTML viewer from disk
+            std::string html_path = gol_path.substr(0, gol_path.find_last_of("/\\")+1) + "serve.html";
+            FILE* hf = fopen(html_path.c_str(), "rb");
+            if (!hf) { hf = fopen("serve.html", "rb"); }
+            if (hf) {
+                fseek(hf, 0, SEEK_END); long sz = ftell(hf); fseek(hf, 0, SEEK_SET);
+                std::vector<uint8_t> html_buf((size_t)sz);
+                fread(html_buf.data(), 1, (size_t)sz, hf);
+                fclose(hf);
+                send_http(client, html_buf, "text/html");
+            } else {
+                send_http_str(client, "<html><body><h1>serve.html not found</h1><p>Place serve.html next to gol.exe, or open it directly.</p></body></html>");
+            }
+        } else if (path.compare(0, 7, "/frame?") == 0) {
+            int gen = -1;
+            if (path.compare(0, 11, "/frame?gen=") == 0)
+                gen = atoi(path.c_str() + 11);
+            if (gen < 0 || gen >= total_frames) {
+                send_http_str(client, "{\"error\":\"invalid gen\"}\n");
+            } else {
+                const auto* data = get_gen_data(gen);
+                if (data) {
+                    send_http(client, *data);
+                } else {
+                    send_http_str(client, "{\"error\":\"decode failed\"}\n");
+                }
+            }
+        } else {
+            send_http_str(client, "{\"error\":\"not found\"}\n");
+        }
+        closesocket(client);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1451,7 +2503,17 @@ static void usage(const char* p) {
         "  %s init   <config.cfg>\n"
         "  %s archive-info <file.gol>\n"
         "  %s extract <file.gol> <gen> <out.cells>\n"
-        "  %s render  <file.gol> <rW> <rH> <fps> [threads]\n\n"
+        "  %s export-coords <file.gol> <gen> <out.bin>\n"
+        "  %s snapshot  <file.gol|cells> <gen> <out.bmp> <rW> <rH> [rgb24|gray8|monow] [cx cy cw ch]\n"
+        "    Render a single generation to a BMP image file (no ffmpeg needed).\n"
+        "    gen is ignored for .cells input.\n\n"
+        "  %s serve  <file.gol> [port]\n"
+        "    HTTP server streaming live cell coords to HTML viewer (default port 8080).\n"
+        "    Open serve.html in a browser to watch.\n\n"
+        "  %s render  <file.gol> <rW> <rH> <fps> [rgb24|gray8|monow] [cx cy cw ch] [threads]\n"
+        "    rgb24 = 3 bytes/pixel age-colored (default), gray8 = 1 byte/pixel 0/255\n"
+        "    monow = 1 bit/pixel MSB-packed (lowest pipe bandwidth, uses ffmpeg pix_fmt=monow)\n"
+        "    crop renders a sub-region; for 1:1  pixel-to-cell use crop_w <= rW, crop_h <= rH\n\n"
         "Pattern names (use directly in place of state file):\n"
         "  any *.cells file in built_in_patterns/\n\n"
         "Examples:\n"
@@ -1459,7 +2521,8 @@ static void usage(const char* p) {
         "  ./gol video 1920 1080 500 60 1920 1080 8 glider B3/S23\n"
         "  ./gol bench 3840 2160 1000 8 glider\n"
         "  ./gol sim life.cfg                        # saves run.gol\n"
-        "  ./gol render run.gol 1920 1080 60 | ffmpeg ...  # render archive to video\n\n"
+        "  ./gol render run.gol 1920 1080 60 | ffmpeg ...  # render archive to video\n"
+        "  ./gol render run.gol 7680 4320 60 0 0 7500 3750 | ...  # 1:1 tile with black padding\n\n"
         "Video pipe:\n"
         "  ./gol video 3840 2160 600 60 1920 1080 8 | ffmpeg \\\n"
         "    -f rawvideo -pixel_format rgb24 -video_size 1920x1080 -framerate 60 -i - \\\n"
@@ -1469,7 +2532,7 @@ static void usage(const char* p) {
         "  ./gol sim life.cfg\n"
         "  ./gol archive-info run.gol\n\n"
         "Rules: B3/S23 (Conway)  B36/S23 (HighLife)  B3/S12345 (Maze)  B2/S (Seeds)\n",
-        p,p,p,p,p,p,p,p);
+         p,p,p,p,p,p,p,p,p,p,p);
 }
 
 int main(int argc, char** argv) {
@@ -1483,6 +2546,10 @@ int main(int argc, char** argv) {
     if (mode=="archive-info") {
         if (argc<3) { fprintf(stderr,"Usage: %s archive-info <file.gol>\n",argv[0]); return 1; }
         archive_info(argv[2]); return 0;
+    }
+    if (mode=="analyse") {
+        if (argc<3) { fprintf(stderr,"Usage: %s analyse <file.gol>\n",argv[0]); return 1; }
+        run_analyse(argv[2]); return 0;
     }
     if (mode=="extract") {
         if (argc<5) { fprintf(stderr,"Usage: %s extract <file.gol> <gen> <out.cells>\n",argv[0]); return 1; }
@@ -1523,11 +2590,63 @@ int main(int argc, char** argv) {
         if (argc>3) cfg.threads=atoi(argv[3]);
         return run_sim(cfg);
     }
+    if (mode=="serve") {
+        int port = 8080;
+        if (argc>3) port = atoi(argv[3]);
+        if (argc<3) { fprintf(stderr,"Usage: %s serve <file.gol> [port]\n",argv[0]); return 1; }
+        run_serve(argv[2], port);
+        return 0;
+    }
+    if (mode=="export-coords") {
+        if (argc<5) { fprintf(stderr,"Usage: %s export-coords <file.gol> <gen> <out.bin>\n",argv[0]); return 1; }
+        run_export_coords(argv[2], atoi(argv[3]), argv[4]);
+        return 0;
+    }
+    if (mode=="snapshot") {
+        if (argc<7) { fprintf(stderr,"Usage: %s snapshot <file> <gen> <out.bmp> <rW> <rH> [rgb24|gray8|monow] [cx cy cw ch]\n",argv[0]); return 1; }
+        {
+            int gen = atoi(argv[3]);
+            int rW = atoi(argv[5]), rH = atoi(argv[6]);
+            std::string pix_fmt = "rgb24";
+            int cx=0, cy=0, cw=0, ch=0;
+            int idx = 7;
+            if (idx < argc) {
+                std::string a = argv[idx];
+                if (a == "rgb24" || a == "gray8" || a == "monow") { pix_fmt = a; idx++; }
+            }
+            if (idx + 4 <= argc) {
+                cx = atoi(argv[idx]); cy = atoi(argv[idx+1]);
+                cw = atoi(argv[idx+2]); ch = atoi(argv[idx+3]);
+            }
+            run_snapshot(argv[2], gen, argv[4], rW, rH, pix_fmt, cx, cy, cw, ch);
+        }
+        return 0;
+    }
     if (mode=="render") {
         if (argc<6) { usage(argv[0]); return 1; }
         int rW=atoi(argv[3]), rH=atoi(argv[4]), FPS=atoi(argv[5]);
-        int threads = argc>6 ? atoi(argv[6]) : omp_get_max_threads();
-        run_render(argv[2], rW, rH, FPS, threads);
+        std::string pix_fmt = "rgb24";
+        int cx=0, cy=0, cw=0, ch=0;
+        int threads = omp_get_max_threads();
+
+        // Parse positional args after the required 5: [fmt] or [cx cy cw ch] or [cx cy cw ch threads]
+        int idx = 6;
+        if (idx < argc) {
+            std::string a = argv[idx];
+            if (a == "rgb24" || a == "gray8" || a == "monow") {
+                pix_fmt = a;
+                idx++;
+            }
+        }
+        if (idx + 4 <= argc) {
+            cx = atoi(argv[idx]); cy = atoi(argv[idx+1]);
+            cw = atoi(argv[idx+2]); ch = atoi(argv[idx+3]);
+            idx += 4;
+            if (idx < argc) threads = atoi(argv[idx]);
+        } else if (idx < argc) {
+            threads = atoi(argv[idx]);
+        }
+        run_render(argv[2], rW, rH, FPS, threads, pix_fmt, cx, cy, cw, ch);
         return 0;
     }
 
