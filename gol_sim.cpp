@@ -123,6 +123,7 @@
 #include <cassert>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 #include <queue>
 #include <omp.h>
@@ -643,6 +644,74 @@ static uint8_t* block_sparse_decode(const uint8_t* compressed, size_t csize, siz
         }
     }
     return result;
+}
+
+// Combined sparse-decode + XOR + coord-extract in one pass.
+// Updates prev_bits in-place (no 128 MB intermediate buffer).
+// Returns binary coord data ([count:u32][x:u16,y:u16]...).
+static std::vector<uint8_t> sparse_decode_xor_extract(
+    const uint8_t* compressed, size_t csize, size_t nbytes,
+    int W, int H, uint8_t* prev_bits)
+{
+    size_t nblocks=(nbytes+GOL_BLOCK_SIZE-1)/GOL_BLOCK_SIZE;
+    size_t mask_bytes=(nblocks+7)/8;
+    int row_bytes=(W+7)/8;
+
+    std::vector<uint8_t> coords(4,0);
+    coords.reserve(800004);
+    uint32_t count=0;
+
+    const uint8_t* mask=compressed;
+    const uint8_t* blocks_data=compressed+mask_bytes;
+    size_t block_pos=0;
+
+    for (size_t i=0;i<nblocks;i++) {
+        size_t off=i*GOL_BLOCK_SIZE;
+        size_t blen=((off+GOL_BLOCK_SIZE)<=nbytes)?GOL_BLOCK_SIZE:(nbytes-off);
+        if (!(mask[i/8]&(1<<(i%8)))) continue;
+
+        const uint8_t* delta=blocks_data+block_pos;
+        block_pos+=blen;
+
+        size_t nw=blen/8;
+        for (size_t w=0;w<nw;w++) {
+            uint64_t d=((const uint64_t*)delta)[w];
+            uint64_t* p=(uint64_t*)(prev_bits+off+w*8);
+            uint64_t r=d^*p;
+            *p=r;
+            if (!r) continue;
+            int bp=(int)(off+w*8);
+            int y=bp/row_bytes;
+            int x_base=(bp%row_bytes)*8;
+            do {
+                int b=__builtin_ctzll(r);
+                uint16_t x=(uint16_t)(x_base+b), y16=(uint16_t)y;
+                coords.push_back(x&0xFF);coords.push_back(x>>8);
+                coords.push_back(y16&0xFF);coords.push_back(y16>>8);
+                count++;
+                r&=r-1;
+            } while(r);
+        }
+        for (size_t j=nw*8;j<blen;j++) {
+            uint8_t d=delta[j];
+            uint8_t* p=prev_bits+off+j;
+            uint8_t r=d^*p;
+            *p=r;
+            if (!r) continue;
+            int bp=(int)(off+j);
+            int y=bp/row_bytes;
+            int x_start=(bp%row_bytes)*8;
+            for (int b=0;b<8;b++) if (r&(1<<b)) {
+                uint16_t x=(uint16_t)(x_start+b), y16=(uint16_t)y;
+                coords.push_back(x&0xFF);coords.push_back(x>>8);
+                coords.push_back(y16&0xFF);coords.push_back(y16>>8);
+                count++;
+            }
+        }
+    }
+    coords[0]=count&0xFF;coords[1]=(count>>8)&0xFF;
+    coords[2]=(count>>16)&0xFF;coords[3]=(count>>24)&0xFF;
+    return coords;
 }
 
 // Persistent zstd compression context with multi-threading support.
@@ -2242,6 +2311,20 @@ static std::vector<uint8_t> extract_coords_bin(const uint8_t* bits, int W, int H
     return out;
 }
 
+static bool send_all(SOCKET s, const char* data, int len) {
+    while (len > 0) {
+        int n = send(s, data, len, 0);
+        if (n > 0) { data += n; len -= n; }
+        else if (n == 0) return false;
+        else {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK) { Sleep(1); continue; }
+            return false;
+        }
+    }
+    return true;
+}
+
 static void send_http(SOCKET client, const std::vector<uint8_t>& body,
                       const std::string& content_type="application/octet-stream")
 {
@@ -2251,8 +2334,8 @@ static void send_http(SOCKET client, const std::vector<uint8_t>& body,
         "Content-Type: " + content_type + "\r\n"
         "Content-Length: " + std::to_string(body.size()) + "\r\n"
         "Connection: close\r\n\r\n";
-    send(client, header.data(), (int)header.size(), 0);
-    send(client, (const char*)body.data(), (int)body.size(), 0);
+    send_all(client, header.data(), (int)header.size());
+    send_all(client, (const char*)body.data(), (int)body.size());
 }
 
 static void send_http_str(SOCKET client, const std::string& body) {
@@ -2296,9 +2379,9 @@ static void run_serve(const std::string& gol_path, int port) {
     struct CacheSlot { int gen; std::vector<uint8_t> data; bool active; };
     static const int CACHE_CAP = 2000;
     std::vector<uint8_t> prev_bits(nbytes, 0);
-    std::vector<uint8_t> cur_bits(nbytes, 0);
     std::vector<CacheSlot> cache(CACHE_CAP);
     int decoder_gen = -1;
+    std::atomic<int> viewer_gen{0};
     std::mutex cache_mtx;
     std::condition_variable cache_cv;
 
@@ -2307,9 +2390,11 @@ static void run_serve(const std::string& gol_path, int port) {
         FILE* f = fopen(gol_path.c_str(), "rb");
         if (!f) { fprintf(stderr,"Background decoder: cannot open file\n"); return; }
         fseek(f, 64, SEEK_SET);
-        bool first_frame = true;
         auto t0 = std::chrono::steady_clock::now();
         for (int gen = 0; gen < total_frames; gen++) {
+            // Throttle if viewer is too far behind
+            while (gen - viewer_gen.load() > CACHE_CAP - 50)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             uint8_t fhdr[21];
             if (fread(fhdr,1,21,f)!=21) break;
             uint32_t csize=ru32(fhdr+17), usize=ru32(fhdr+13);
@@ -2318,70 +2403,15 @@ static void run_serve(const std::string& gol_path, int port) {
 
             uint8_t* sparse=nullptr;
             if (!zstd_decompress(cdata.data(),csize,&sparse,usize)) { free(sparse); break; }
-            size_t dn=0; uint8_t* dec=block_sparse_decode(sparse,usize,nbytes,&dn);
-            free(sparse);
-            if (!dec) break;
 
             std::unique_lock<std::mutex> lock(cache_mtx);
-            size_t nw=nbytes/8;
-            uint64_t* c64=(uint64_t*)cur_bits.data();
-            uint64_t* p64=(uint64_t*)prev_bits.data();
-            const uint64_t* d64=(const uint64_t*)dec;
-            int row_words=(W+63)/64;
-
-            // Combined XOR + memcpy + extract in one pass
-            std::vector<uint8_t> coords(4,0);
-            coords.reserve(800004);
-            uint32_t count=0;
-            if (first_frame || gen==0) {
-                for (size_t i=0;i<nw;i++) {
-                    uint64_t w=d64[i];
-                    c64[i]=w; p64[i]=w;
-                    if (!w) continue;
-                    int y=(int)(i/row_words);
-                    int bx=(int)(i%row_words)*64;
-                    do {
-                        int b=__builtin_ctzll(w);
-                        uint16_t x=(uint16_t)(bx+b), y16=(uint16_t)y;
-                        coords.push_back(x&0xFF);coords.push_back(x>>8);
-                        coords.push_back(y16&0xFF);coords.push_back(y16>>8);
-                        count++;
-                        w&=w-1;
-                    } while(w);
-                }
-                first_frame=false;
-            } else {
-                for (size_t i=0;i<nw;i++) {
-                    uint64_t w=d64[i]^p64[i];
-                    c64[i]=w; p64[i]=w;
-                    if (!w) continue;
-                    int y=(int)(i/row_words);
-                    int bx=(int)(i%row_words)*64;
-                    do {
-                        int b=__builtin_ctzll(w);
-                        uint16_t x=(uint16_t)(bx+b), y16=(uint16_t)y;
-                        coords.push_back(x&0xFF);coords.push_back(x>>8);
-                        coords.push_back(y16&0xFF);coords.push_back(y16>>8);
-                        count++;
-                        w&=w-1;
-                    } while(w);
-                }
+            auto coords = sparse_decode_xor_extract(sparse, usize, nbytes, W, H, prev_bits.data());
+            free(sparse);
+            if (gen==0) {
+                uint32_t c=0;
+                if (coords.size()>=4) c=(uint32_t)coords[0]|((uint32_t)coords[1]<<8)|((uint32_t)coords[2]<<16)|((uint32_t)coords[3]<<24);
+                fprintf(stderr,"  gen 0: %u cells, %zu bytes coords\n", c, coords.size());
             }
-            // Handle remaining bytes (non-64-bit-aligned tail)
-            for (size_t i=nw*8;i<nbytes;i++) {
-                uint8_t r=dec[i]^(first_frame?0:prev_bits[i]);
-                cur_bits[i]=r; prev_bits[i]=r;
-                if (!r) continue;
-                int gp=(int)i*8;
-                int y=gp/W, x=gp%W;
-                uint16_t x16=(uint16_t)x,y16=(uint16_t)y;
-                coords.push_back(x16&0xFF);coords.push_back(x16>>8);
-                coords.push_back(y16&0xFF);coords.push_back(y16>>8);
-                count++;
-            }
-            coords[0]=count&0xFF;coords[1]=(count>>8)&0xFF;
-            coords[2]=(count>>16)&0xFF;coords[3]=(count>>24)&0xFF;
-            free(dec);
             int slot = gen % CACHE_CAP;
             cache[slot].gen = gen;
             cache[slot].data = std::move(coords);
@@ -2390,10 +2420,14 @@ static void run_serve(const std::string& gol_path, int port) {
             lock.unlock();
             cache_cv.notify_one();
 
-            if (gen % 10000 == 0) {
+            if (gen % 1000 == 0 || gen == total_frames-1) {
                 auto t1 = std::chrono::steady_clock::now();
                 double ms = std::chrono::duration<double,std::milli>(t1-t0).count();
-                fprintf(stderr,"  Decoded gen %d / %d  (%.1fms total)\r", gen, total_frames, ms);
+                double fps = (gen+1) / (ms/1000.0);
+                if (gen == 0)
+                    fprintf(stderr,"  Decoded gen 0\r");
+                else
+                    fprintf(stderr,"  Decoded gen %d / %d  (%.0f fps, %.1fs total)\r", gen, total_frames, fps, ms/1000.0);
             }
         }
         fclose(f);
@@ -2401,15 +2435,14 @@ static void run_serve(const std::string& gol_path, int port) {
     });
     bg.detach();
 
-    // get_gen_data: read from cache (background thread does the decode)
-    auto get_gen_data = [&](int gen) -> const std::vector<uint8_t>* {
+    // get_gen_data: read from cache (copy inside mutex for thread safety)
+    auto get_gen_data = [&](int gen) -> std::vector<uint8_t> {
         std::unique_lock<std::mutex> lock(cache_mtx);
-        // Wait until this gen is decoded
         cache_cv.wait(lock, [&]() { return decoder_gen >= gen || decoder_gen >= total_frames-1; });
         int slot = gen % CACHE_CAP;
         if (cache[slot].active && cache[slot].gen == gen)
-            return &cache[slot].data;
-        return nullptr;
+            return cache[slot].data; // copy inside mutex
+        return {};
     };
 
     // Start HTTP server
@@ -2448,11 +2481,67 @@ static void run_serve(const std::string& gol_path, int port) {
         if (space2 == std::string::npos) { closesocket(client); continue; }
         std::string path = req.substr(space1+1, space2-space1-1);
 
-        if (path == "/info") {
+        // Log request (trim query string for display)
+        {
+            std::string disp = path;
+            size_t qm = disp.find('?');
+            if (qm != std::string::npos) disp = disp.substr(0, qm);
+            fprintf(stderr,"  HTTP %s\n", disp.c_str());
+        }
+
+        if (path == "/range") {
+            std::unique_lock<std::mutex> lock(cache_mtx);
+            int last = decoder_gen;
+            int first = std::max(0, last - CACHE_CAP + 1);
+            lock.unlock();
+            char json[256];
+            snprintf(json, sizeof(json), "{\"first\":%d,\"last\":%d}\n", first, last);
+            send_http_str(client, json);
+        } else if (path == "/info") {
             char json[256];
             snprintf(json, sizeof(json),
                 "{\"w\":%d,\"h\":%d,\"frames\":%d}\n", W, H, total_frames);
             send_http_str(client, json);
+        } else if (path.compare(0, 13, "/stream?from=") == 0) {
+            int from_gen = atoi(path.c_str() + 13);
+            if (from_gen < 0) from_gen = 0;
+            fprintf(stderr,"  Stream start from gen %d\n", from_gen);
+            std::string hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+            send_all(client, hdr.data(), (int)hdr.size());
+            u_long nb=1; ioctlsocket(client, FIONBIO, &nb);
+            int next = from_gen;
+            int sent = 0;
+            int skipped = 0;
+            char tmp;
+            auto t0 = std::chrono::steady_clock::now();
+            while (next < total_frames) {
+                auto data = get_gen_data(next);
+                if (!data.empty()) {
+                    viewer_gen.store(next);
+                    uint32_t sz = (uint32_t)data.size();
+                    uint8_t szb[4]={(uint8_t)(sz&0xFF),(uint8_t)(sz>>8),(uint8_t)(sz>>16),(uint8_t)(sz>>24)};
+                    if (!send_all(client,(const char*)szb,4)) break;
+                    if (!send_all(client,(const char*)data.data(),(int)data.size())) break;
+                    sent++; next++;
+                } else {
+                    // Frame evicted from cache — skip forward
+                    next++;
+                    skipped++;
+                    // If more than half the cache behind, jump ahead
+                    if (decoder_gen - next > CACHE_CAP/2)
+                        next = std::max(next, decoder_gen - CACHE_CAP/2);
+                    continue;
+                }
+                if (recv(client,&tmp,1,0) <= 0 && WSAGetLastError() != WSAEWOULDBLOCK) break;
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            double sec = std::chrono::duration<double>(t1-t0).count();
+            fprintf(stderr,"  Stream sent %d frames from gen %d in %.1fs (%.0f fps, skipped %d)\n",
+                    sent, from_gen, sec, sent/sec, skipped);
+        } else if (path == "/ping") {
+            uint8_t ping_data[8] = {0x78,0x56,0x34,0x12,0x00,0x00,0x00,0x00};
+            std::vector<uint8_t> ping(ping_data, ping_data+8);
+            send_http(client, ping);
         } else if (path == "/" || path == "/serve.html") {
             // Serve the HTML viewer from disk
             std::string html_path = gol_path.substr(0, gol_path.find_last_of("/\\")+1) + "serve.html";
@@ -2472,13 +2561,23 @@ static void run_serve(const std::string& gol_path, int port) {
             if (path.compare(0, 11, "/frame?gen=") == 0)
                 gen = atoi(path.c_str() + 11);
             if (gen < 0 || gen >= total_frames) {
-                send_http_str(client, "{\"error\":\"invalid gen\"}\n");
+                fprintf(stderr,"  /frame?gen=%d  INVALID\n", gen);
+                { std::string msg = "invalid gen (0-" + std::string(std::to_string(total_frames-1)) + ")";
+                  std::string e = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(msg.size()) + "\r\nConnection: close\r\n\r\n" + msg;
+                  send_all(client, e.data(), (int)e.size()); }
             } else {
-                const auto* data = get_gen_data(gen);
-                if (data) {
-                    send_http(client, *data);
+                auto data = get_gen_data(gen);
+                if (!data.empty()) {
+                    viewer_gen.store(gen);
+                    uint32_t c=0;
+                    if (data.size()>=4) c=(uint32_t)data[0]|((uint32_t)data[1]<<8)|((uint32_t)data[2]<<16)|((uint32_t)data[3]<<24);
+                    fprintf(stderr,"  /frame?gen=%d  %u cells  %zu bytes\n", gen, c, data.size());
+                    send_http(client, data);
                 } else {
-                    send_http_str(client, "{\"error\":\"decode failed\"}\n");
+                    fprintf(stderr,"  /frame?gen=%d  NOT IN CACHE (decoder at %d)\n", gen, decoder_gen);
+                    { std::string msg = "gen not in cache (decoder at " + std::to_string(decoder_gen) + ")";
+                      std::string e = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(msg.size()) + "\r\nConnection: close\r\n\r\n" + msg;
+                      send_all(client, e.data(), (int)e.size()); }
                 }
             }
         } else {

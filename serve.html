@@ -19,11 +19,13 @@ canvas:active{cursor:grabbing}
 #seek::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#4af;cursor:pointer}
 #speed{width:50px;background:#222;border:1px solid #444;color:#ccc;padding:2px 6px;border-radius:3px;font-size:12px;text-align:center}
 #info{position:fixed;top:8px;left:8px;color:#888;font-size:12px;background:rgba(0,0,0,.7);padding:4px 8px;border-radius:4px;pointer-events:none;z-index:10}
+#errorBar{position:fixed;top:40px;left:8px;right:8px;color:#f88;font-size:13px;background:rgba(80,0,0,.8);padding:6px 10px;border-radius:4px;display:none;z-index:10;word-break:break-all}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="info">Connecting...</div>
+<div id="errorBar"></div>
 <div id="controls">
   <button id="playBtn">⏸</button>
   <label><span id="genLabel">0</span> / <span id="maxLabel">0</span></label>
@@ -34,209 +36,203 @@ canvas:active{cursor:grabbing}
 </div>
 <script>
 const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
-let W,H,GRID_W,GRID_H,TOTAL_FRAMES=0,curGen=0,maxLoaded=0;
-let cells=null,cx=null,cy=null,cellColors=null,cellCount=0;
+let GRID_W,GRID_H,TOTAL_FRAMES=0,curGen=0;
+let cx=null,cy=null,cellColors=null,cellCount=0;
 let scale=1,panX=0,panY=0,dragging=false,dragX,dragY,dragPanX,dragPanY;
-let playing=true,interval=16,loading=false,timeoutId=null,pixBuf=null,pixSize=0;
+let playing=true,interval=16.67;
 // Age tracking
-let prevCellSet=null;
 let cellAgeMap=new Map();
+let prevKeySet=new Set(),curKeySet=new Set();
 const MAX_AGE=128;
 const AGEST=[[0,[255,255,255]],[.2,[255,255,0]],[.4,[255,165,0]],[.6,[152,255,152]],[.8,[100,200,255]],[1,[0,0,255]]];
-function ageColor(age){
-  const t=Math.min(age/MAX_AGE,1);
+const colorLUT=new Uint32Array(256);
+for(let a=0;a<256;a++){
+  const t=Math.min(a/MAX_AGE,1); let col=0xFF000028;
   for(let i=0;i<AGEST.length-1;i++)if(t>=AGEST[i][0]&&t<AGEST[i+1][0]){
     const l=(t-AGEST[i][0])/(AGEST[i+1][0]-AGEST[i][0]);
-    const a=AGEST[i][1],b=AGEST[i+1][1];
-    const r=a[0]+(b[0]-a[0])*l,g=a[1]+(b[1]-a[1])*l,bl=a[2]+(b[2]-a[2])*l;
-    return 0xFF000000|Math.round(r)<<16|Math.round(g)<<8|Math.round(bl);
+    const a0=AGEST[i][1],b=AGEST[i+1][1];
+    col=0xFF000000|Math.round(a0[0]+(b[0]-a0[0])*l)<<16|Math.round(a0[1]+(b[1]-a0[1])*l)<<8|Math.round(a0[2]+(b[2]-a0[2])*l);
+    break;
   }
-  return 0xFF000028;
+  colorLUT[a]=col;
 }
 
-function resize(){W=canvas.width=window.innerWidth;H=canvas.height=window.innerHeight;draw()}
+// ─── Stream reader ───
+let streamReader=null,frameQueue=[],streamGen=0,streamActive=false;
+let lastFrameTime=0,totalDecoded=0;
+const MAX_QUEUE=500;
+// Available gen range from cache
+let rangeFirst=0,rangeLast=0;
+
+function setError(msg){
+  const el=document.getElementById('errorBar');
+  if(msg){el.textContent='ERROR: '+msg;el.style.display='block'}else{el.style.display='none'}
+}
+
+function resize(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;draw()}
 window.onresize=resize;
+function fitToScreen(){resize();const s=Math.min(canvas.width/GRID_W,canvas.height/GRID_H)*0.9;scale=s;panX=(canvas.width-GRID_W*s)/2;panY=(canvas.height-GRID_H*s)/2;draw()}
 
-function fitToScreen(){
-  resize();
-  const sx=W/GRID_W,sy=H/GRID_H;
-  scale=Math.min(sx,sy)*0.9;
-  panX=(W-GRID_W*scale)/2;
-  panY=(H-GRID_H*scale)/2;
-  draw();
+function parseFrame(buf){
+  const ab=buf instanceof ArrayBuffer?buf:buf.buffer;
+  const off=buf instanceof ArrayBuffer?0:buf.byteOffset;
+  const view=new DataView(ab,off,buf.byteLength);
+  const count=view.getUint32(0,true);
+  if(count>100000000){setError('Invalid frame: count='+count);return}
+  if(!cx||cx.length<count){cx=new Uint16Array(count);cy=new Uint16Array(count)}
+  if(!cellColors||cellColors.length<count)cellColors=new Uint32Array(count);
+  for(let i=0;i<count;i++){
+    cx[i]=view.getUint16(4+i*4,true);
+    cy[i]=view.getUint16(6+i*4,true);
+  }
+  curKeySet.clear();
+  for(let i=0;i<count;i++){
+    const key=(cy[i]<<16)|cx[i];
+    curKeySet.add(key);
+    const p=cellAgeMap.get(key);
+    cellAgeMap.set(key,p!==undefined?(p<255?p+1:255):0);
+  }
+  for(const k of prevKeySet)if(!curKeySet.has(k))cellAgeMap.delete(k);
+  const tmp=prevKeySet;prevKeySet=curKeySet;curKeySet=tmp;
+  for(let i=0;i<count;i++)cellColors[i]=colorLUT[cellAgeMap.get((cy[i]<<16)|cx[i])];
+  cellCount=count;totalDecoded++;
 }
 
-function draw(tNet,tParse){
+function draw(){
   if(!cellCount)return;
-  const t0=performance.now();
-  const needed=W*H;
-  if(needed!==pixSize){pixBuf=new Uint32Array(needed);pixSize=needed}
-  const d=pixBuf;
+  const W=canvas.width,H=canvas.height;
+  if(!window._id||window._idW!==W||window._idH!==H){window._id=ctx.createImageData(W,H);window._idW=W;window._idH=H}
+  const d=new Uint32Array(window._id.data.buffer);
   d.fill(0);
-
   if(scale>=1){
-    // ——— Each cell is ≥1 screen pixel — draw as integer-aligned tiles ———
-    const sz=Math.round(scale);
-    const vpL=-panX/scale,vpT=-panY/scale;
-    const vpR=vpL+W/scale,vpB=vpT+H/scale;
+    const sz=Math.round(scale),vpL=-panX/scale,vpT=-panY/scale;
     const minX=Math.max(0,Math.floor(vpL)),minY=Math.max(0,Math.floor(vpT));
-    const maxX=Math.min(GRID_W,Math.ceil(vpR)),maxY=Math.min(GRID_H,Math.ceil(vpB));
+    const maxX=Math.min(GRID_W,Math.ceil(vpL+W/scale)),maxY=Math.min(GRID_H,Math.ceil(vpT+H/scale));
     for(let i=0;i<cellCount;i++){
       const x=cx[i],y=cy[i];
       if(x>=minX&&x<maxX&&y>=minY&&y<maxY){
         let sx=Math.round(panX+x*scale),sy=Math.round(panY+y*scale);
-        if(sx<0)sx=0;if(sy<0)sy=0;
-        const mx=Math.min(sx+sz,W),my=Math.min(sy+sz,H);
-        const col=cellColors[i];
-        for(let dy=sy;dy<my;dy++)for(let dx=sx;dx<mx;dx++)d[dy*W+dx]=col;
+        if(sx<0)sx=0;if(sy<0)sy=0;const col=cellColors[i];
+        const xEnd=Math.min(sx+sz,W),yEnd=Math.min(sy+sz,H);
+        for(let dy=sy;dy<yEnd;dy++){const rowOff=dy*W;for(let dx=sx;dx<xEnd;dx++)d[rowOff+dx]=col}
       }
     }
   }else{
-    // ——— Sub-pixel LOD: bin visible viewport only ———
     const vpL=-panX/scale,vpT=-panY/scale;
-    const vpR=vpL+W/scale,vpB=vpT+H/scale;
     const gx0=Math.max(0,Math.floor(vpL)),gy0=Math.max(0,Math.floor(vpT));
-    const gx1=Math.min(GRID_W,Math.ceil(vpR)),gy1=Math.min(GRID_H,Math.ceil(vpB));
-    const vpW=gx1-gx0,vpH=gy1-gy0;
-    const step=Math.ceil(1/scale);
-    const binW=Math.ceil(vpW/step),binH=Math.ceil(vpH/step);
-    const counts=new Uint16Array(Math.max(1,binW*binH));
-    for(let i=0;i<cellCount;i++){
-      const x=cx[i],y=cy[i];
-      if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1){
-        const bx=Math.floor((x-gx0)/step),by=Math.floor((y-gy0)/step);
-        counts[by*binW+bx]++;
-      }
-    }
-    const threshold=0;
-    const sx0=Math.round(panX+gx0*scale),sy0=Math.round(panY+gy0*scale);
-    const bsp=step*scale;
-    const bsi=Math.max(1,Math.ceil(bsp));
-    for(let by=0;by<binH;by++){
-      const sy=sy0+Math.round(by*bsp);
-      if(sy>=H)break;
-      for(let bx=0;bx<binW;bx++){
-        if(counts[by*binW+bx]>threshold){
-          const sx=sx0+Math.round(bx*bsp);
-          if(sx>=W)break;
-          const mx=Math.min(sx+bsi,W),my=Math.min(sy+bsi,H);
-          for(let dy=sy;dy<my;dy++)for(let dx=sx;dx<mx;dx++)d[dy*W+dx]=0xFFFFFFFF;
-        }
-      }
-    }
+    const gx1=Math.min(GRID_W,Math.ceil(vpL+W/scale)),gy1=Math.min(GRID_H,Math.ceil(vpT+H/scale));
+    const step=Math.ceil(1/scale),binW=Math.ceil((gx1-gx0)/step),binH=Math.ceil((gy1-gy0)/step);
+    const bins=new Uint16Array(Math.max(1,binW*binH));
+    for(let i=0;i<cellCount;i++){const x=cx[i],y=cy[i];if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1)bins[Math.floor((y-gy0)/step)*binW+Math.floor((x-gx0)/step)]++}
+    const sx0=Math.round(panX+gx0*scale),sy0=Math.round(panY+gy0*scale),bsp=step*scale,bsi=Math.max(1,Math.ceil(bsp));
+    for(let by=0;by<binH;by++){const sy=Math.round(sy0+by*bsp);if(sy>=H)break;const rowOff=sy*W;for(let bx=0;bx<binW;bx++){if(!bins[by*binW+bx])continue;const sx=Math.round(sx0+bx*bsp);if(sx>=W)break;const xEnd=Math.min(sx+bsi,W),yEnd=Math.min(sy+bsi,H);for(let dy=sy;dy<yEnd;dy++){const off=dy*W;for(let dx=sx;dx<xEnd;dx++)d[off+dx]=0xFFFFFFFF}}}
   }
-
-  // Blit pixel buffer to canvas via Uint32 view (single copy)
-  const img=ctx.createImageData(W,H);
-  new Uint32Array(img.data.buffer).set(d);
-  ctx.putImageData(img,0,0);
-  // Time info
-  const now=performance.now();
-  let parts=[`${GRID_W}x${GRID_H}  ${TOTAL_FRAMES.toLocaleString()} frames`];
-  if(tNet!==undefined)parts.push(`net:${(tParse-tNet).toFixed(0)}ms`);
-  if(tParse!==undefined)parts.push(`parse:${(t0-tParse).toFixed(0)}ms`);
-  parts.push(`draw:${(now-t0).toFixed(1)}ms`);
-  document.getElementById('info').textContent=parts.join('  ');
+  ctx.putImageData(window._id,0,0);
+  document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  gen ${curGen.toLocaleString()}`;
 }
 
-canvas.onwheel=e=>{
-  e.preventDefault();
-  const os=scale,mx=e.clientX,my=e.clientY;
-  scale*=e.deltaY>0?.85:1.18;
-  scale=Math.max(.005,Math.min(scale,64));
-  panX=mx-(mx-panX)*scale/os;
-  panY=my-(my-panY)*scale/os;
-  draw();
-};
-canvas.onmousedown=e=>{dragging=true;dragX=e.clientX;dragY=e.clientY;dragPanX=panX;dragPanY=panY};
-canvas.onmousemove=e=>{if(dragging){panX=dragPanX+(e.clientX-dragX);panY=dragPanY+(e.clientY-dragY);draw()}};
-canvas.onmouseup=canvas.onmouseleave=()=>{dragging=false};
+// ─── Controls ───
+canvas.onwheel=e=>{e.preventDefault();const os=scale,mx=e.clientX,my=e.clientY;scale*=e.deltaY>0?.85:1.18;scale=Math.max(.005,Math.min(scale,64));panX=mx-(mx-panX)*scale/os;panY=my-(my-panY)*scale/os;draw()}
+canvas.onmousedown=e=>{dragging=true;dragX=e.clientX;dragY=e.clientY;dragPanX=panX;dragPanY=panY}
+canvas.onmousemove=e=>{if(dragging){panX=dragPanX+(e.clientX-dragX);panY=dragPanY+(e.clientY-dragY);draw()}}
+canvas.onmouseup=canvas.onmouseleave=()=>{dragging=false}
 
-function scheduleNext(){
-  if(timeoutId){clearTimeout(timeoutId);timeoutId=null}
-  if(playing&&!loading&&curGen<TOTAL_FRAMES-1)
-    timeoutId=setTimeout(()=>loadGen(curGen+1),interval);
-}
+document.getElementById('playBtn').onclick=()=>{playing=!playing;document.getElementById('playBtn').textContent=playing?'⏸':'▶'}
+document.getElementById('speed').onchange=function(){interval=1000/Math.max(1,Math.min(144,parseInt(this.value)||60))}
+document.getElementById('seek').oninput=function(){const avail=rangeLast-rangeFirst;if(avail<=0)return;const gen=rangeFirst+Math.round(this.value/100*avail);if(gen!==curGen)seekGen(gen)}
 
-document.getElementById('playBtn').onclick=()=>{
-  playing=!playing;
-  document.getElementById('playBtn').textContent=playing?'⏸':'▶';
-  if(playing)scheduleNext();
-  else if(timeoutId){clearTimeout(timeoutId);timeoutId=null}
-};
-document.getElementById('speed').onchange=function(){
-  const fps=Math.max(1,Math.min(144,parseInt(this.value)||60));
-  interval=1000/fps;
-  if(playing)scheduleNext();
-};
-document.getElementById('seek').oninput=function(){
-  if(!maxLoaded)return;
-  const gen=Math.round(this.value/100*maxLoaded);
-  if(gen!==curGen)loadGen(gen);
-};
-
-async function loadGen(gen){
-  if(loading||gen<0||gen>=TOTAL_FRAMES)return;
-  loading=true;
-  curGen=gen;
-  document.getElementById('genLabel').textContent=gen;
-  document.getElementById('seek').value=maxLoaded>0?gen/maxLoaded*100:0;
-  const tNet=performance.now();
+async function seekGen(gen){
+  if(streamReader){streamReader.cancel();streamReader=null;streamActive=false}
+  setError(null);
   try{
     const res=await fetch(`/frame?gen=${gen}`);
+    if(!res.ok){setError('seek: server returned '+res.status+' for gen '+gen);startStream(rangeFirst);return}
     const buf=await res.arrayBuffer();
-    const tParse=performance.now();
-    const view=new DataView(buf);
-    const count=view.getUint32(0,true);
-    cellCount=count;
-    cx=new Uint16Array(count);
-    cy=new Uint16Array(count);
-    for(let i=0;i<count;i++){cx[i]=view.getUint16(4+i*4,true);cy[i]=view.getUint16(6+i*4,true)}
+    if(buf.byteLength<4){setError('seek: empty response for gen '+gen);startStream(rangeFirst);return}
+    parseFrame(buf);curGen=gen;
+    const avail=rangeLast-rangeFirst;
+    if(avail>0)document.getElementById('seek').value=(gen-rangeFirst)/avail*100;
+    draw();
+  }catch(e){setError('Seek: '+e.message);startStream(rangeFirst);return}
+  startStream(gen+1);
+}
 
-    // Compute ages & colors
-    const curSet=new Set();
-    const ages=new Uint8Array(count);
-    for(let i=0;i<count;i++){
-      const key=(cy[i]<<16)|cx[i];
-      curSet.add(key);
-      const prev=cellAgeMap.get(key);
-      ages[i]=prev!==undefined?Math.min(prev+1,255):0;
+// ─── Range polling ───
+async function pollRange(){
+  try{
+    const res=await fetch('/range');
+    if(!res.ok)return;
+    const r=await res.json();
+    if(r.last>rangeLast||r.first!=rangeFirst){
+      rangeFirst=r.first;rangeLast=r.last;
+      const avail=rangeLast-rangeFirst;
+      document.getElementById('maxLabel').textContent=avail>0?`${rangeFirst.toLocaleString()}-${rangeLast.toLocaleString()}`:TOTAL_FRAMES.toLocaleString();
     }
-    // Remove dead cells
-    if(prevCellSet)for(const key of prevCellSet)if(!curSet.has(key))cellAgeMap.delete(key);
-    // Update ages
-    for(let i=0;i<count;i++){
-      const key=(cy[i]<<16)|cx[i];
-      cellAgeMap.set(key,ages[i]);
-    }
-    prevCellSet=curSet;
+  }catch(e){/* ignore */}
+}
 
-    cellColors=new Uint32Array(count);
-    for(let i=0;i<count;i++)cellColors[i]=ageColor(ages[i]);
+// ─── Stream loop ───
+async function startStream(fromGen){
+  if(streamReader){streamReader.cancel();streamReader=null}
+  streamActive=false;frameQueue=[];
+  await pollRange();
+  const start=Math.max(fromGen,rangeFirst);
+  if(start!=fromGen)setError('Adjusted stream from gen '+fromGen+' to '+start+' (cache window)');
+  try{
+    const res=await fetch('/stream?from='+start);
+    if(!res.ok||!res.body){setError('Stream returned '+res.status);return}
+    streamReader=res.body.getReader();streamGen=start;streamActive=true;
+    readLoop();
+  }catch(e){setError('Stream: '+e.message)}
+}
 
-    if(gen>maxLoaded){maxLoaded=gen;document.getElementById('decodedLabel').textContent=maxLoaded}
-    document.getElementById('maxLabel').textContent=maxLoaded;
-    document.getElementById('seek').value=maxLoaded>0?gen/maxLoaded*100:0;
-    draw(tNet,tParse);
-  }catch(e){document.getElementById('info').textContent='Error: '+e.message}
-  loading=false;
-  scheduleNext();
+async function readLoop(){
+  let buf=new Uint8Array(0);
+  while(streamActive&&streamReader){
+    try{
+      while(frameQueue.length>=MAX_QUEUE&&streamActive)
+        await new Promise(r=>setTimeout(r,10));
+      const{value,done}=await streamReader.read();
+      if(done){streamActive=false;break}
+      if(!value)continue;
+      let tmp=new Uint8Array(buf.length+value.length);tmp.set(buf);tmp.set(value,buf.length);buf=tmp;
+      while(buf.length>=4){
+        const sz=buf[0]|(buf[1]<<8)|(buf[2]<<16)|(buf[3]<<24);
+        if(buf.length<4+sz)break;
+        frameQueue.push(buf.slice(4,4+sz));buf=buf.slice(4+sz);streamGen++;
+      }
+    }catch(e){streamActive=false;break}
+  }
+}
+
+// ─── Render loop ───
+function renderLoop(time){
+  if(playing&&frameQueue.length>0&&time-lastFrameTime>=interval){
+    const data=frameQueue.shift();
+    parseFrame(data);curGen++;
+    document.getElementById('genLabel').textContent=curGen;
+    const avail=rangeLast-rangeFirst;
+    if(avail>0)document.getElementById('seek').value=(curGen-rangeFirst)/avail*100;
+    document.getElementById('decodedLabel').textContent=totalDecoded;
+    draw();
+    if(curGen%200==0)pollRange();
+    lastFrameTime=time;
+  }
+  requestAnimationFrame(renderLoop);
 }
 
 async function init(){
   try{
-    const res=await fetch('/info');
-    const info=await res.json();
+    const res=await fetch('/info');const info=await res.json();
     GRID_W=info.w;GRID_H=info.h;TOTAL_FRAMES=info.frames;
+    document.getElementById('maxLabel').textContent=TOTAL_FRAMES.toLocaleString();
     document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  ${TOTAL_FRAMES.toLocaleString()} frames`;
+    await pollRange();
     fitToScreen();
-    await loadGen(0);
-  }catch(e){
-    document.getElementById('info').textContent='Cannot connect to server';
-    document.getElementById('playBtn').disabled=true;
-  }
+    await startStream(rangeFirst);
+    requestAnimationFrame(renderLoop);
+  }catch(e){document.getElementById('info').textContent='Cannot connect';document.getElementById('playBtn').disabled=true}
 }
-
 init();
 </script>
 </body>
