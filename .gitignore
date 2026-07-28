@@ -5,3 +5,8 @@ err.txt
 *.log
 __pycache__
 *.mp4
+built_in_patterns/conwaylife/p1megacell.cells
+built_in_patterns/conwaylife/p59glidergunoriginal.cells
+built_in_patterns/conwaylife/p59glidergun8kx8k.cells
+built_in_patterns/oscillator/p1megacell.cells
+built_in_patterns/gun/p59glidergunoriginal.cells
