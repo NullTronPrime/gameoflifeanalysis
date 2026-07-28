@@ -3,3 +3,5 @@
 .vscode/
 err.txt
 *.log
+__pycache__
+*.mp4

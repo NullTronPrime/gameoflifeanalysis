@@ -1,0 +1,14 @@
+!Name: Sidecar
+!Author: Hartmut Holzwart
+!An orthogonal period 4 c/2 tagalong for the heavyweight spaceship that was found in 1992.
+!www.conwaylife.com/wiki/index.php?title=Sidecar
+!
+.O......
+O.....O.
+O.....O.
+OOOOO.O.
+....OO..
+..O....O
+.O......
+.O.....O
+.OOOOOO.

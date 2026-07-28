@@ -1,0 +1,41 @@
+!Name: VERY_1ST
+!CThe very first glider gun
+!C
+!CIn November of 1970 the first glider gun was discovered by Bill Gosper' group at
+!CMIT.This is a well known historic fact. But was the famous p30 glider gun really
+!Cthe first gun to be discovered?  William Poundstone writes in his book "The
+!CRecursive Universe" (Contemporary Books, Inc., Chicago, 1985, ISBN
+!C0-8092-5202-3) on page 105:
+!C
+!CThe Glider Gun
+!CThe shuttle is provocative - it tries to produce a beehive every fifteen
+!Cgenerations. This seems so close to unlimited growth. If the old beehives moved
+!Cout of the way, it would be. A group of MIT students including R. William Gosper,
+!CJr., Robert April, Michael Beeler, Richard Howell, Rich Schroeppel, and Michael
+!CSpeciner wondered if there was some way to modify the shuttle to produce gliders
+!Cinstead. They tried to arrange two shuttles to interact periodically. There are many
+!Cways that two shuttles can interact. They can meet at 90 degrees or at 180
+!Cdegrees. They can be in phase or out of phase by any number of generations up
+!Cto twenty-nine. They can meet head on or a little off to the side. Gosper's group
+!Cexperimented on a computer and found an arrangement of shuttles that produces
+!Ca glider. Unfortunately, the glider crashed into one of the shuttles and destroyed it.
+!CAfter further experimentation, Gosper's group found a true glider gun.
+!C[End of citation]
+!C
+!CAha, there was another gun even before the famous first gun! Although it was
+!Cextremely short-lived (it shot itself to death with the very first glider it fired), it was a
+!Cgun nevertheless. Here is this very first glider gun. Luckily, there is a way to save
+!Cthe gun's life permanently by adding a third queen bee shuttle. The additional
+!Cshuttle has nothing to do with the glider production. It only deflects the gliders to
+!Canother path before they can crash into the gun.
+!C
+!CThe very first glider gun even comes in three different variants: The life-saving
+!Cthird shuttle can be delayed by four or eight generations and shifted by one or two
+!Ccells to SW with respect to the variant shown here.
+!C
+!CFor a use of the very first glider gun see the pattern GG15.LIF.
+!C
+!CBill Gosper et al, 1970 (refound and fixed by Dieter Leithner, before 1996)
+!Source: Life-DL-98
+!
+OO...OOOOO.....OOOOOOO..O.OOOO...OOO

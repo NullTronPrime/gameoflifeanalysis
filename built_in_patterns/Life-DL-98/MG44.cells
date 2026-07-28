@@ -1,0 +1,13 @@
+!Name: MG44
+!CGliderless p44 MWSS gun
+!C
+!CThis gliderless gun is based on Dave Buckingham's p44 oscillator. It is very similar
+!Cto Paul Callahan's p44 glider gun. Only a standard eater is replaced by an eater2
+!Cand moved to a different location. At the time of this writing (June 1998) this gun is
+!Cthe smallest known MWSS gun of any period, including MWSS guns with gliders.
+!C
+!CDieter Leithner, 5 Apr 1997, improved 3 Jun 1998 by Stephen Silver with his
+!Cwarped eater2
+!Source: Life-DL-98
+!
+OOOOOO.....OOOOOOOOOOOOOOOOOOOOOO.OOOOOOOOOO

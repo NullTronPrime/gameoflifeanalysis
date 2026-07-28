@@ -1,0 +1,10 @@
+!Name: THUEK_IN
+!C Thue-like generator.
+!C
+!C 2x glider reflection,
+!C Infinite kickback.
+!C
+!C Helmut Postl, January 1997.
+!Source: hppatterns
+!
+OOOOO...OOOOOO.OOOOOOOOOOOOOOOOOOOOOO.OOOOOO...OOOOO

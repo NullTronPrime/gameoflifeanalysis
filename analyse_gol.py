@@ -39,6 +39,7 @@ Requires: numpy, scipy (both standard; `pip install numpy scipy` if missing).
 
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import defaultdict
@@ -348,11 +349,28 @@ def build_catalog():
 
 CATALOG = build_catalog()
 
+# Try to load extended catalog from pre-computed signatures
+_CATALOG_EXT = None
+_CATALOG_EXT_PATH = os.path.join(os.path.dirname(__file__), "built_in_patterns", "catalog_signatures.json")
+if os.path.exists(_CATALOG_EXT_PATH):
+    try:
+        with open(_CATALOG_EXT_PATH) as f:
+            _CATALOG_EXT = json.load(f)
+    except Exception:
+        _CATALOG_EXT = None
+
 
 def catalog_lookup(raw_sig):
     sig = canonical_signature(raw_sig)
     hit = CATALOG.get(sig)
-    return hit if hit else (None, None)
+    if hit:
+        return hit
+    if _CATALOG_EXT is not None:
+        sig_key = ";".join(f"{r},{c}" for r, c in sig)
+        ext_hit = _CATALOG_EXT.get(sig_key)
+        if ext_hit:
+            return (ext_hit["name"], ext_hit["category"])
+    return (None, None)
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,30 @@
+!Name: DOPPLER
+!CDoppler rake
+!C
+!CThis p48 double glider rake visualizes a basic wave physics effect in Life. I named
+!Cit after the Austrian physicist Christian Doppler (1803 - 1853) for two reasons:
+!C
+!C- The double glider rake demonstrates the Doppler effect in the Life universe.
+!C- Doppler is also the German word for "doubler".
+!C
+!CDoppler discovered 1842 that the observed frequency of periodical waves is
+!Cchanged if the source of the waves moves with respect to the observer. Well
+!Cknown examples of this frequency shift are the acoustical and the optical Doppler
+!Ceffects.
+!C
+!CEvery 48 generations the rake emits two gliders, one in the backward and one in
+!Cthe forward direction. Note the large distance of successive gliders in the
+!Cbackward stream and the much smaller distance of gliders in the forward stream.
+!CIn view of the fact that the Doppler rake emits equal numbers of gliders into both
+!Cstreams, these different distances appear to be counterintuitive.
+!C
+!CA Life astronomer would see the frequency of the backward gliders red-shifted
+!Cwhereas the forward stream's frequency would appear blue-shifted to him or her.
+!C
+!CFor applications of the Doppler rake see the patterns BREEDER1.LIF and
+!CBREEDER2.LIF.
+!C
+!CDieter Leithner, 13 Aug 1991
+!Source: Life-DL-98
+!
+OOOOOO.......OOOOOOOOOOOOO.OOOOO

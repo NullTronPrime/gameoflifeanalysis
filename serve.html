@@ -104,31 +104,55 @@ function draw(){
   if(!window._id||window._idW!==W||window._idH!==H){window._id=ctx.createImageData(W,H);window._idW=W;window._idH=H}
   const d=new Uint32Array(window._id.data.buffer);
   d.fill(0);
+  const vpL=-panX/scale,vpT=-panY/scale;
+  const gx0=Math.max(0,Math.floor(vpL)),gy0=Math.max(0,Math.floor(vpT));
+  const gx1=Math.min(GRID_W,Math.ceil(vpL+W/scale)),gy1=Math.min(GRID_H,Math.ceil(vpT+H/scale));
   if(scale>=1){
-    const sz=Math.round(scale),vpL=-panX/scale,vpT=-panY/scale;
-    const minX=Math.max(0,Math.floor(vpL)),minY=Math.max(0,Math.floor(vpT));
-    const maxX=Math.min(GRID_W,Math.ceil(vpL+W/scale)),maxY=Math.min(GRID_H,Math.ceil(vpT+H/scale));
+    const sz=Math.ceil(scale);
     for(let i=0;i<cellCount;i++){
       const x=cx[i],y=cy[i];
-      if(x>=minX&&x<maxX&&y>=minY&&y<maxY){
-        let sx=Math.round(panX+x*scale),sy=Math.round(panY+y*scale);
-        if(sx<0)sx=0;if(sy<0)sy=0;const col=cellColors[i];
+      if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1){
+        const sx=Math.floor(panX+x*scale),sy=Math.floor(panY+y*scale);
+        if(sx+sz<0||sy+sz<0||sx>=W||sy>=H)continue;
+        const col=cellColors[i];
         const xEnd=Math.min(sx+sz,W),yEnd=Math.min(sy+sz,H);
-        for(let dy=sy;dy<yEnd;dy++){const rowOff=dy*W;for(let dx=sx;dx<xEnd;dx++)d[rowOff+dx]=col}
+        const sxC=Math.max(sx,0),syC=Math.max(sy,0);
+        for(let dy=syC;dy<yEnd;dy++){const rowOff=dy*W;for(let dx=sxC;dx<xEnd;dx++)d[rowOff+dx]=col}
       }
     }
   }else{
-    const vpL=-panX/scale,vpT=-panY/scale;
-    const gx0=Math.max(0,Math.floor(vpL)),gy0=Math.max(0,Math.floor(vpT));
-    const gx1=Math.min(GRID_W,Math.ceil(vpL+W/scale)),gy1=Math.min(GRID_H,Math.ceil(vpT+H/scale));
-    const step=Math.ceil(1/scale),binW=Math.ceil((gx1-gx0)/step),binH=Math.ceil((gy1-gy0)/step);
-    const bins=new Uint16Array(Math.max(1,binW*binH));
-    for(let i=0;i<cellCount;i++){const x=cx[i],y=cy[i];if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1)bins[Math.floor((y-gy0)/step)*binW+Math.floor((x-gx0)/step)]++}
-    const sx0=Math.round(panX+gx0*scale),sy0=Math.round(panY+gy0*scale),bsp=step*scale,bsi=Math.max(1,Math.ceil(bsp));
-    for(let by=0;by<binH;by++){const sy=Math.round(sy0+by*bsp);if(sy>=H)break;const rowOff=sy*W;for(let bx=0;bx<binW;bx++){if(!bins[by*binW+bx])continue;const sx=Math.round(sx0+bx*bsp);if(sx>=W)break;const xEnd=Math.min(sx+bsi,W),yEnd=Math.min(sy+bsi,H);for(let dy=sy;dy<yEnd;dy++){const off=dy*W;for(let dx=sx;dx<xEnd;dx++)d[off+dx]=0xFFFFFFFF}}}
+    const step=Math.ceil(1/scale);
+    const binW=Math.ceil((gx1-gx0)/step),binH=Math.ceil((gy1-gy0)/step);
+    const bins=new Uint32Array(Math.max(1,binW*binH));
+    const ageBins=new Uint32Array(Math.max(1,binW*binH));
+    for(let i=0;i<cellCount;i++){
+      const x=cx[i],y=cy[i];
+      if(x>=gx0&&x<gx1&&y>=gy0&&y<gy1){
+        const bi=Math.floor((y-gy0)/step)*binW+Math.floor((x-gx0)/step);
+        bins[bi]++; ageBins[bi]+=(cellColors[i]>>>24);
+      }
+    }
+    const sx0=Math.floor(panX+gx0*scale),sy0=Math.floor(panY+gy0*scale);
+    const bsp=step*scale,bsi=Math.max(1,Math.floor(bsp));
+    for(let by=0;by<binH;by++){
+      const sy=Math.floor(sy0+by*bsp);
+      if(sy>=H)break;
+      const rowOff=sy*W;
+      for(let bx=0;bx<binW;bx++){
+        const bc=bins[by*binW+bx];
+        if(!bc)continue;
+        const sx2=Math.floor(sx0+bx*bsp);
+        if(sx2>=W)break;
+        const xEnd2=Math.min(sx2+bsi,W),yEnd2=Math.min(sy+bsi,H);
+        const avgAge=ageBins[by*binW+bx]/bc;
+        const brightness=Math.min(255,128+Math.floor(avgAge*2));
+        const col=0xFF000000|(brightness<<16)|(brightness<<8)|brightness;
+        for(let dy=sy;dy<yEnd2;dy++){const off=dy*W;for(let dx=sx2;dx<xEnd2;dx++)d[off+dx]=col}
+      }
+    }
   }
   ctx.putImageData(window._id,0,0);
-  document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  gen ${curGen.toLocaleString()}`;
+  document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  gen ${curGen.toLocaleString()}  cells ${cellCount.toLocaleString()}`;
 }
 
 // ─── Controls ───
@@ -144,6 +168,8 @@ document.getElementById('seek').oninput=function(){const avail=rangeLast-rangeFi
 async function seekGen(gen){
   if(streamReader){streamReader.cancel();streamReader=null;streamActive=false}
   setError(null);
+  // Reset age tracking on seek
+  cellAgeMap.clear();prevKeySet.clear();curKeySet.clear();
   try{
     const res=await fetch(`/frame?gen=${gen}`);
     if(!res.ok){setError('seek: server returned '+res.status+' for gen '+gen);startStream(rangeFirst);return}
@@ -229,7 +255,13 @@ async function init(){
     document.getElementById('info').textContent=`${GRID_W}x${GRID_H}  ${TOTAL_FRAMES.toLocaleString()} frames`;
     await pollRange();
     fitToScreen();
-    await startStream(rangeFirst);
+    // Fetch and display gen 0 explicitly, then start streaming from gen 1
+    const initRes=await fetch('/frame?gen=0');
+    if(initRes.ok){
+      const initBuf=await initRes.arrayBuffer();
+      if(initBuf.byteLength>=4){parseFrame(initBuf);curGen=0;draw()}
+    }
+    await startStream(1);
     requestAnimationFrame(renderLoop);
   }catch(e){document.getElementById('info').textContent='Cannot connect';document.getElementById('playBtn').disabled=true}
 }

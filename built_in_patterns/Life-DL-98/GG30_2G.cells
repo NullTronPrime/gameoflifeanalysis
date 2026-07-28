@@ -1,0 +1,11 @@
+!Name: GG30_2G
+!Cp30 double glider gun
+!C
+!CThe device uses 4 copies of Bill Gosper's p30 glider gun, 2 copies of a
+!Cblock-assisted two-glider reaction and 2 copies of the p30 glider pusher
+!C(consisting of a p30 queen bee shuttle and a p15 pentadecathlon).
+!C
+!CDieter Leithner, 13 May 1994
+!Source: Life-DL-98
+!
+OOO.OOOO.OOOOOOOOOOOOOOOOOO.OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO

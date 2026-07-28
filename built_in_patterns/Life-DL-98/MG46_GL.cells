@@ -1,0 +1,11 @@
+!Name: MG46_GL
+!CGliderless p46 MWSS gun
+!C
+!CThe gun uses a small gliderless p46 HWSS gun (see the pattern HG46.LIF) and a
+!Cp46 HWSS to MWSS downconverter. (The downconverter always needs an
+!Cinput HWSS).
+!C
+!CDieter Leithner, 20 Sep 1997
+!Source: Life-DL-98
+!
+OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO.OOOOOOOOOOOOOOOOO

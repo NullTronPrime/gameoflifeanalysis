@@ -1,0 +1,15 @@
+!Name: Star with blocks
+!A period 3 oscillator that is a modification of star.
+!www.conwaylife.com/wiki/index.php?title=Star
+!
+OO...O...OO
+OO..OOO..OO
+..OOO.OOO..
+..O.....O..
+.OO.....OO.
+OO.......OO
+.OO.....OO.
+..O.....O..
+..OOO.OOO..
+OO..OOO..OO
+OO...O...OO

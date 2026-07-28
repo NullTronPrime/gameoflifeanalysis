@@ -1,0 +1,15 @@
+!Name: Triple pseudo still life
+!Author: Gabriel Nivasch
+!A 32-cell still life found in 2001 that can be broken down into three stable pieces, but not two.
+!http://www.conwaylife.com/wiki/index.php?title=Triple_pseudo_still_life
+!
+......OO
+..O.O..O
+.O.OO.O.
+.O....OO
+OO.OO...
+...OO.OO
+OO....O.
+.O.OO.O.
+O..O.O..
+OO......

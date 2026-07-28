@@ -1,0 +1,14 @@
+!Name: GG690
+!Cp690 glider gun
+!C
+!CThis gun combines the p30 and p46 shuttles of Bill Gosper's historic first two glider
+!Cguns. It produces a glider every 690 generations which is the least common
+!Cmultiple (LCM) of 30 and 46. The p30 shuttle at the top is not really necessary as a
+!Csimple block could eliminate the beehive as well. However, the additional shuttle
+!Creduces the bounding box of the gun by two lines. The gun was discovered
+!Cindependently twice.
+!C
+!CNoam Elkies and Dieter Leithner, 8 Nov 1993
+!Source: Life-DL-98
+!
+OO..OOO..OOOOOOOOOOOOOOOOOOO....OOO.OOO...........OO

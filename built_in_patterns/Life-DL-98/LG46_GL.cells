@@ -1,0 +1,13 @@
+!Name: LG46_GL
+!CGliderless p46 LWSS gun
+!C
+!CThis gun is composed of two different p46 factories which manufacture pre-traffic
+!Clights. The pre-TLs react to form a LWSS which flies away in time to clear the site
+!Cfor the next production cycle. At the time of this writing (June 1998) this is the
+!Csmallest gliderless p46 LWSS gun known. For a use of this gun see the pattern
+!CLG8280.LIF.
+!C
+!CDieter Leithner, 29 Mar 1998
+!Source: Life-DL-98
+!
+OOO....OOOOOOOO....OOOOOOOOO.OOOOOOOOOOO.OO.OOOOOO.....OOOOOO

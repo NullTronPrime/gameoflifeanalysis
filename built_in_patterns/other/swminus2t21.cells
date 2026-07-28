@@ -1,0 +1,15 @@
+!Name: swminus2t21
+!SW-2T21
+!The beehive variant of a common Herschel-to-glider converter that
+!allows a Herschel's first natural glider to escape
+!http://www.conwaylife.com/wiki/SW-2
+!http://www.conwaylife.com/patterns/swminus2t21.rle
+!
+...........O.
+..........O.O
+..........O.O
+...........O.
+O............
+O.O..........
+OOO..........
+..O..........

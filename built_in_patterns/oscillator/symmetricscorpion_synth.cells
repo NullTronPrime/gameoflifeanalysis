@@ -1,0 +1,16 @@
+!Name: symmetricscorpion_synth.rle
+!Author: Bob Shemyakin, 16 June 2014
+!4-glider synthesis of symmetric scorpion
+!http://conwaylife.com/wiki/Symmetric_scorpion
+!http://conwaylife.com/forums/viewtopic.php?p=12276#p12276
+!
+..O..O.O...................OO.
+O.O..OO...................O..O
+.OO...O...................O.OO
+.........................OO...
+..........................O.OO
+..........................O..O
+...........................OO.
+OOO......O....................
+..O.....OO....................
+.O......O.O...................

@@ -22,6 +22,11 @@
  *
  *   gol archive-info  <file.gol>
  *       Print metadata from a .gol archive without running the sim.
+ *       Scans actual frame count (handles truncated archives).
+ *
+ *   gol sparse-render  <file.gol> <out_w> <out_h> [max_frames] [cluster_gap]
+ *       Cluster-based sparse render of .gol archive → RGB24 → pipe to ffmpeg.
+ *       Groups active blocks by 2D Chebyshev distance, sizes panels by area.
  *
  * ─────────────────────────────── .gol FORMAT ──────────────────────────────
  *
@@ -110,6 +115,12 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
+#define FSEEK64 _fseeki64
+#define FTELL64 _ftelli64
+#else
+#define _FILE_OFFSET_BITS 64
+#define FSEEK64 fseeko
+#define FTELL64 ftello
 #endif
 #include <cstring>
 #include <cstdio>
@@ -1082,25 +1093,48 @@ static void archive_info(const std::string& path) {
     uint8_t comp    = hdr[36];
     int     zl      = hdr[37];
 
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
+    // Scan actual frame count (handles truncated/corrupted archives)
+    uint32_t actual_gens = 0;
+    if (comp == GOL_COMPRESS_DELTA) {
+        while (true) {
+            uint8_t fhdr[21];
+            if (fread(fhdr,1,21,f)!=21) break;
+            uint32_t csize = ru32(fhdr+17);
+            if (csize > 100*1024*1024) break;
+            if (FSEEK64(f,(int64_t)csize,SEEK_CUR)!=0) break;
+            actual_gens++;
+        }
+    } else {
+        while (true) {
+            uint8_t fhdr[12];
+            if (fread(fhdr,1,12,f)!=12) break;
+            size_t frame_nbytes = ((size_t)W*H+7)/8;
+            if (FSEEK64(f,(int64_t)frame_nbytes,SEEK_CUR)!=0) break;
+            actual_gens++;
+        }
+    }
+    FSEEK64(f, 0, SEEK_END);
+    int64_t fsize = FTELL64(f);
     fclose(f);
 
-    fprintf(stderr,"=== .gol Archive Info ===\n");
-    fprintf(stderr,"File:        %s  (%.2f MB)\n", path.c_str(), fsize/1048576.0);
+    bool corrupted = (actual_gens != gens);
+    fprintf(stderr,"=== .gol Archive Info%s===\n", corrupted ? " (WARNING: header mismatch — using actual)" : "");
+    fprintf(stderr,"File:        %s  (%.2f MB)\n", path.c_str(), (double)fsize/1048576.0);
     fprintf(stderr,"Grid:        %dx%d\n", W, H);
     fprintf(stderr,"Rules:       %s\n", rules_str(B,S).c_str());
     fprintf(stderr,"Compression: %s (zstd level %d)\n",
             comp==0?"none":"delta+blocksparse+zstd", zl);
-    fprintf(stderr,"Generations: %u\n", gens);
+    fprintf(stderr,"Generations: %u", actual_gens);
+    if (corrupted) fprintf(stderr,"  (header says %u)", gens);
+    fprintf(stderr,"\n");
     if (fps>0) fprintf(stderr,"FPS hint:    %u\n", fps);
     if (sp==-1)       fprintf(stderr,"Stagnation:  extinction\n");
     else if (sp==0)   fprintf(stderr,"Stagnation:  max_gens reached (none detected)\n");
     else              fprintf(stderr,"Stagnation:  period %d cycle, detected at gen %d\n", sp, sg);
     size_t raw_per = 12 + (size_t)((W*H+7)/8);
-    double ratio = (double)raw_per * gens / fsize;
+    double ratio = (double)raw_per * actual_gens / fsize;
     fprintf(stderr,"Raw frame:   %zu bytes  |  Compressed: %.2f MB total  |  Ratio: %.1fx\n",
-            raw_per, fsize/1048576.0, ratio);
+            raw_per, (double)fsize/1048576.0, ratio);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1596,7 +1630,9 @@ static void run_video(int W, int H, int GENS, int FPS, int rW, int rH,
 
 static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int THREADS,
                        const std::string& pix_fmt = "rgb24",
-                       int crop_x=0, int crop_y=0, int crop_w=0, int crop_h=0) {
+                       int crop_x=0, int crop_y=0, int crop_w=0, int crop_h=0,
+                       bool sparse=false, int cluster_gap=100,
+                       bool binary=false) {
     omp_set_num_threads(THREADS);
     SET_STDOUT_BINARY();
 
@@ -1631,9 +1667,11 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
     int row_bytes = monow ? ((rW + 7) / 8) : (rW * bpp);
     size_t frame_bytes = monow ? (size_t)((rW * rH + 7) / 8) : ((size_t)rW * rH * bpp);
 
-    // Age tracking only for the crop region (not needed in mono/monow mode)
-    size_t crop_cells = (size_t)crop_w * crop_h;
-    uint8_t* ages = (uint8_t*)calloc(1, (mono || monow) ? 1 : crop_cells);
+    // Age tracking skipped in binary mode and mono/monow
+    bool skip_age = (mono || monow || binary);
+    // Age tracking: full grid for sparse mode, otherwise crop region only
+    size_t age_cells = sparse ? ((size_t)grid_w * grid_h) : (size_t)crop_w * crop_h;
+    uint8_t* ages = (uint8_t*)calloc(1, skip_age ? 1 : age_cells);
 
     fprintf(stderr,"=== GoL Render from Archive ===\n");
     fprintf(stderr,"Archive: %s  Render: %dx%d @ %d fps  Format: %s\n",
@@ -1654,24 +1692,32 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
     }
     total_frames++;
 
-    if (!mono && !monow) {
-        // Compute ages for gen 0 (crop region only)
-        #pragma omp parallel for
-        for (int r = crop_y; r < c_y2; r++) {
-            size_t row_off = (size_t)r * grid_w;
-            size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
-            for (int c = crop_x; c < c_x2; c++) {
-                int byte_idx = (int)((row_off + c) / 8);
-                int bit_idx  = (int)((row_off + c) % 8);
-                int alive = (bits[byte_idx] >> bit_idx) & 1;
-                ages[crop_row_off + (c - crop_x)] = alive ? 1 : 0;
+    if (!skip_age) {
+        if (sparse) {
+            #pragma omp parallel for
+            for (size_t i = 0; i < (size_t)grid_h * grid_w; i++) {
+                int alive = (bits[i/8] >> (i%8)) & 1;
+                ages[i] = alive ? 1 : 0;
+            }
+        } else {
+            // Compute ages for gen 0 (crop region only)
+            #pragma omp parallel for
+            for (int r = crop_y; r < c_y2; r++) {
+                size_t row_off = (size_t)r * grid_w;
+                size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
+                for (int c = crop_x; c < c_x2; c++) {
+                    int byte_idx = (int)((row_off + c) / 8);
+                    int bit_idx  = (int)((row_off + c) % 8);
+                    int alive = (bits[byte_idx] >> bit_idx) & 1;
+                    ages[crop_row_off + (c - crop_x)] = alive ? 1 : 0;
+                }
             }
         }
     }
 
-    // Age color LUT (not used in mono/monow mode)
+    // Age color LUT (not used in mono/monow/binary mode)
     uint8_t age_lut_r[129], age_lut_g[129], age_lut_b[129];
-    if (!mono && !monow) {
+    if (!skip_age) {
         age_lut_r[0]=age_lut_g[0]=age_lut_b[0]=0;
         for (int a=1; a<=128; a++) {
             float t=(a-1)/127.0f;
@@ -1683,12 +1729,245 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
         }
     }
 
+    // ── Sparse mode: location-relative cluster panels ──
+    // Each cluster gets a panel placed near its grid-relative position.
+    // Scale adapts: very sparse → large cells fill canvas; denser → bbox fills canvas.
+    // Uniform scale, no stretching. Only touches active cells.
+    const int BS=128, BPB=BS*8, MARG=8;
+    const int nblocks = (int)(((size_t)grid_w*grid_h+7)/8 + BS - 1) / BS;
+
+    auto render_sparse_frame = [&](int gen) -> bool {
+        std::vector<uint8_t>& bits_ref = bits;
+
+        // ── 1. Find active blocks ──
+        std::vector<int> active_blocks;
+        size_t nbytes = (size_t)((size_t)grid_w*grid_h+7)/8;
+        for (int i=0; i<nblocks; i++) {
+            size_t off = (size_t)i * BS;
+            size_t blen = std::min((size_t)BS, nbytes - off);
+            bool nonzero = false;
+            const uint64_t* w64 = (const uint64_t*)(bits_ref.data()+off);
+            for (size_t w=0; w<blen/8 && !nonzero; w++) if (w64[w]) nonzero=true;
+            if (nonzero) active_blocks.push_back(i);
+        }
+
+        // ── 2. Greedy+merge clustering ──
+        struct Cl { int r0,c0,r1,c1; };
+        std::vector<Cl> raw;
+        for (int bi : active_blocks) {
+            int start_bit = bi * BPB;
+            int r = start_bit / grid_w, c = start_bit % grid_w;
+            bool placed = false;
+            for (auto& cl : raw) {
+                int dx = std::max({cl.r0-r, r-cl.r1, 0});
+                int dy = std::max({cl.c0-c, c-cl.c1, 0});
+                if (dx<=cluster_gap && dy<=cluster_gap) {
+                    cl.r0=std::min(cl.r0,r); cl.c0=std::min(cl.c0,c);
+                    cl.r1=std::max(cl.r1,r); cl.c1=std::max(cl.c1,c);
+                    placed=true; break;
+                }
+            }
+            if (!placed) raw.push_back({r,c,r,c});
+        }
+        bool changed=true;
+        while (changed) {
+            changed=false;
+            std::vector<Cl> merged;
+            std::vector<char> used(raw.size(),0);
+            for (size_t i=0; i<raw.size(); i++) {
+                if (used[i]) continue;
+                for (size_t j=i+1; j<raw.size(); j++) {
+                    if (used[j]) continue;
+                    int dx=std::max({raw[i].r0-raw[j].r1, raw[j].r0-raw[i].r1, 0});
+                    int dy=std::max({raw[i].c0-raw[j].c1, raw[j].c0-raw[i].c1, 0});
+                    if (dx<=cluster_gap && dy<=cluster_gap) {
+                        raw[i].r0=std::min(raw[i].r0,raw[j].r0);
+                        raw[i].c0=std::min(raw[i].c0,raw[j].c0);
+                        raw[i].r1=std::max(raw[i].r1,raw[j].r1);
+                        raw[i].c1=std::max(raw[i].c1,raw[j].c1);
+                        used[j]=1; changed=true;
+                    }
+                }
+                merged.push_back(raw[i]); used[i]=1;
+            }
+            raw=std::move(merged);
+        }
+
+        // ── 3. Tighten bboxes to actual live cells (parallel) ──
+        int rb=(grid_w+7)/8;
+        std::vector<Cl> clusters(raw.size());
+        std::vector<char> cluster_valid(raw.size(), 0);
+        #pragma omp parallel for
+        for (int ci=0; ci<(int)raw.size(); ci++) {
+            auto& cl = raw[ci];
+            int sr0=std::max(0,cl.r0-MARG);
+            int sr1=std::min(grid_h,cl.r1+BPB/grid_w+MARG);
+            int sc0=std::max(0,cl.c0-MARG);
+            int sc1=std::min(grid_w,cl.c1+BPB+MARG);
+            int min_r=grid_h, max_r=0, min_c=grid_w, max_c=0;
+            for (int r=sr0; r<sr1; r++) {
+                size_t row_off=(size_t)r*rb;
+                int cw0=sc0/64, cw1=(sc1-1)/64;
+                for (int cw=cw0; cw<=cw1; cw++) {
+                    uint64_t w=*(const uint64_t*)(bits_ref.data()+row_off+cw*8);
+                    if (cw==cw0) { int s=sc0%64; w>>=s; if (cw==cw1) w&=((1ULL<<(sc1-sc0))-1); }
+                    else if (cw==cw1) { int bl=sc1-cw*64; if (bl<64) w&=((1ULL<<bl)-1); }
+                    if (!w) continue;
+                    int f=__builtin_ctzll(w), l=63-__builtin_clzll(w);
+                    int base=cw*64, cc0=base+f, cc1=base+l;
+                    if (cc0<min_c) min_c=cc0; if (cc1>max_c) max_c=cc1;
+                    if (r<min_r) min_r=r; if (r>max_r) max_r=r;
+                }
+            }
+            if (max_r==0) continue;
+            clusters[ci]={min_r,min_c,max_r+1,max_c+1};
+            cluster_valid[ci]=1;
+        }
+        // Compact
+        { std::vector<Cl> tmp;
+            for (int ci=0; ci<(int)raw.size(); ci++) if (cluster_valid[ci]) tmp.push_back(clusters[ci]);
+            clusters=std::move(tmp); }
+        if (clusters.empty()) {
+            frame_buf.assign((size_t)rW*rH*3, 0);
+            if (fwrite(frame_buf.data(),1,(size_t)rW*rH*3,stdout) != (size_t)rW*rH*3) return false;
+            return true;
+        }
+
+        // ── 4. Sort clusters by grid position (raster scan order) ──
+        // This gives stable ordering when clusters are at fixed grid positions.
+        std::sort(clusters.begin(),clusters.end(),[](const Cl& a,const Cl& b){
+            int ar=(a.r0+a.r1)/2, ac=(a.c0+a.c1)/2;
+            int br=(b.r0+b.r1)/2, bc=(b.c0+b.c1)/2;
+            return ar!=br ? ar<br : ac<bc;
+        });
+
+        // ── 5. Compute uniform scale ──
+        // Scale: largest cluster fills ~45% of canvas (min dimension).
+        // Limits: 1.0 (min pixel) to 100.0.
+        int max_cw=0, max_ch=0;
+        for (auto& cl : clusters) {
+            int cw=cl.c1-cl.c0, ch=cl.r1-cl.r0;
+            if (cw>max_cw) max_cw=cw; if (ch>max_ch) max_ch=ch;
+        }
+        double sx = (rW * 0.45) / std::max(max_cw,1);
+        double sy = (rH * 0.45) / std::max(max_ch,1);
+        double scale = std::min(sx, sy);
+        if (scale < 1.0) scale = 1.0;
+        if (scale > 100.0) scale = 100.0;
+
+        // ── 6a. Layout panels left-to-right (serial) ──
+        auto& canvas = frame_buf;
+        canvas.assign((size_t)rW*rH*3, 0);
+        const int PAD=4;
+        struct PanelD { int px,py,pw,ph,r0,r1,c0,c1; };
+        std::vector<PanelD> pd;
+        { int px=PAD, py=PAD, row_h=0;
+            for (auto& cl : clusters) {
+                int pw = (int)((cl.c1-cl.c0) * scale);
+                int ph = (int)((cl.r1-cl.r0) * scale);
+                if (pw < 2) pw=2; if (ph < 2) ph=2;
+                if (px+pw+PAD > rW) { px=PAD; py+=row_h+PAD; row_h=0; }
+                if (py+ph+PAD > rH) break;
+                if (ph>row_h) row_h=ph;
+                pd.push_back({px,py,pw,ph,cl.r0,cl.r1,cl.c0,cl.c1});
+                px += pw + PAD;
+            }
+        }
+
+        // ── 6b. Render all panels in parallel ──
+        #pragma omp parallel for
+        for (int ci=0; ci<(int)pd.size(); ci++) {
+            auto& p = pd[ci];
+            int px=p.px, py=p.py, r0=p.r0, r1=p.r1, c0=p.c0, c1=p.c1;
+            for (int r=r0; r<r1; r++) {
+                size_t brow_off = (size_t)r * rb;
+                int cw0=c0/64, cw1=(c1-1)/64;
+                for (int cw=cw0; cw<=cw1; cw++) {
+                    uint64_t w = *(const uint64_t*)(bits_ref.data()+brow_off+cw*8);
+                    if (cw==cw0) { int s=c0%64; w>>=s; if (cw==cw1) w&=((1ULL<<(c1-c0))-1); }
+                    else if (cw==cw1) { int bl=c1-cw*64; if (bl<64) w&=((1ULL<<bl)-1); }
+                    if (!w) continue;
+                    do {
+                        int bit = __builtin_ctzll(w);
+                        int gcx = (cw==cw0) ? c0+bit : cw*64+bit;
+                        int s_px = px + (int)((gcx - c0) * scale);
+                        int s_py = py + (int)((r - r0) * scale);
+                        int s_px1 = px + (int)((gcx+1 - c0) * scale);
+                        int s_py1 = py + (int)((r+1 - r0) * scale);
+                        if (s_px1 <= s_px) s_px1 = s_px+1;
+                        if (s_py1 <= s_py) s_py1 = s_py+1;
+                        if (s_px1 <= 0 || s_py1 <= 0 || s_px >= rW || s_py >= rH) { w&=w-1; continue; }
+                        if (s_px < 0) s_px=0; if (s_py < 0) s_py=0;
+                        if (s_px1 > rW) s_px1=rW; if (s_py1 > rH) s_py1=rH;
+
+                        if (binary) {
+                            for (int dy=s_py; dy<s_py1; dy++) {
+                                uint8_t* row_out = canvas.data() + (size_t)dy * rW * 3;
+                                for (int dx=s_px; dx<s_px1; dx++) {
+                                    row_out[dx*3]=255; row_out[dx*3+1]=255; row_out[dx*3+2]=255;
+                                }
+                            }
+                        } else {
+                            uint8_t a = ages[(size_t)r * grid_w + gcx];
+                            uint8_t cr_lut=age_lut_r[a], cg_lut=age_lut_g[a], cb_lut=age_lut_b[a];
+                            for (int dy=s_py; dy<s_py1; dy++) {
+                                uint8_t* row_out = canvas.data() + (size_t)dy * rW * 3;
+                                for (int dx=s_px; dx<s_px1; dx++) {
+                                    row_out[dx*3]=cr_lut; row_out[dx*3+1]=cg_lut; row_out[dx*3+2]=cb_lut;
+                                }
+                            }
+                        }
+                        w &= w - 1;
+                    } while (w);
+                }
+            }
+        }
+
+        if (fwrite(canvas.data(),1,(size_t)rW*rH*3,stdout) != (size_t)rW*rH*3) return false;
+        return true;
+    };
+
     // Detect 1:1 mode (each cell maps to exactly 1 pixel, with black padding)
     bool is_1to1 = (crop_w <= rW && crop_h <= rH);
 
     // Helper: render output row from crop region
     auto render_row = [&](int py, const uint8_t* src, uint8_t* out) {
-        if (monow) {
+        if (binary) {
+            // Binary: any cell alive in mapped region → white pixel
+            memset(out, 0, (size_t)rW * 3);
+            if (py < crop_h) {
+                int abs_r = crop_y + py;
+                if (is_1to1) {
+                    size_t row_bit_off = (size_t)abs_r * grid_w;
+                    for (int px = 0; px < crop_w; px++) {
+                        int abs_c = crop_x + px;
+                        size_t idx = row_bit_off + abs_c;
+                        int alive = (bits[idx/8] >> (idx%8)) & 1;
+                        if (alive) {
+                            out[px*3]=255; out[px*3+1]=255; out[px*3+2]=255;
+                        }
+                    }
+                } else {
+                    int gr0=crop_y+(int)((double)py*crop_h/rH), gr1=crop_y+(int)((double)(py+1)*crop_h/rH);
+                    if (gr1<=gr0) gr1=gr0+1; if (gr1>c_y2) gr1=c_y2;
+                    for (int px=0; px<rW; px++) {
+                        int gc0=crop_x+(int)((double)px*crop_w/rW), gc1=crop_x+(int)((double)(px+1)*crop_w/rW);
+                        if (gc1<=gc0) gc1=gc0+1; if (gc1>c_x2) gc1=c_x2;
+                        bool found=false;
+                        for (int gr=gr0; gr<gr1 && !found; gr++) {
+                            size_t row_off = (size_t)gr * grid_w;
+                            for (int gc=gc0; gc<gc1 && !found; gc++) {
+                                size_t idx = row_off + gc;
+                                found = (bits[idx/8] >> (idx%8)) & 1;
+                            }
+                        }
+                        if (found) {
+                            out[px*3]=255; out[px*3+1]=255; out[px*3+2]=255;
+                        }
+                    }
+                }
+            }
+        } else if (monow) {
             // Monow: 1 bit per pixel, MSB-first packed (ffmpeg pixel_format=monow)
             // Internal grid is LSB-first, so we bit-reverse each output byte.
             memset(out, 0, (size_t)((rW + 7) / 8));
@@ -1749,42 +2028,63 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
     };
 
     // Render gen 0
+    bool pipe_ok = true;
     if (rW>0 && rH>0) {
-        frame_buf.resize(frame_bytes);
-        #pragma omp parallel for
-        for (int py=0; py<rH; py++)
-            render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
-        fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+        if (sparse) {
+            if (!render_sparse_frame(0)) pipe_ok = false;
+        } else {
+            frame_buf.resize(frame_bytes);
+            #pragma omp parallel for
+            for (int py=0; py<rH; py++)
+                render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
+            if (fwrite(frame_buf.data(),1,frame_bytes,stdout) != frame_bytes) pipe_ok = false;
+        }
     }
 
     for (int gen = 1; ; gen++) {
         if (!stream.read_next(live_count, bits)) break;
         total_frames++;
 
-        if (!mono && !monow) {
-            // Update ages for crop region only
-            #pragma omp parallel for
-            for (int r = crop_y; r < c_y2; r++) {
-                size_t row_off = (size_t)r * grid_w;
-                size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
-                for (int c = crop_x; c < c_x2; c++) {
-                    size_t idx = row_off + c;
-                    int alive = (bits[idx/8] >> (idx%8)) & 1;
-                    size_t aidx = crop_row_off + (c - crop_x);
+        if (!skip_age) {
+            if (sparse) {
+                #pragma omp parallel for
+                for (size_t i = 0; i < (size_t)grid_h * grid_w; i++) {
+                    int alive = (bits[i/8] >> (i%8)) & 1;
                     if (alive) {
-                        ages[aidx] = (ages[aidx] >= 127) ? 127 : ages[aidx] + 1;
+                        ages[i] = (ages[i] >= 127) ? 127 : ages[i] + 1;
                     } else {
-                        ages[aidx] = 0;
+                        ages[i] = 0;
+                    }
+                }
+            } else {
+                // Update ages for crop region only
+                #pragma omp parallel for
+                for (int r = crop_y; r < c_y2; r++) {
+                    size_t row_off = (size_t)r * grid_w;
+                    size_t crop_row_off = (size_t)(r - crop_y) * crop_w;
+                    for (int c = crop_x; c < c_x2; c++) {
+                        size_t idx = row_off + c;
+                        int alive = (bits[idx/8] >> (idx%8)) & 1;
+                        size_t aidx = crop_row_off + (c - crop_x);
+                        if (alive) {
+                            ages[aidx] = (ages[aidx] >= 127) ? 127 : ages[aidx] + 1;
+                        } else {
+                            ages[aidx] = 0;
+                        }
                     }
                 }
             }
         }
 
         if (rW>0 && rH>0) {
-            #pragma omp parallel for
-            for (int py=0; py<rH; py++)
-                render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
-            fwrite(frame_buf.data(), 1, frame_bytes, stdout);
+            if (sparse) {
+                if (!render_sparse_frame(gen)) { pipe_ok = false; break; }
+            } else {
+                #pragma omp parallel for
+                for (int py=0; py<rH; py++)
+                    render_row(py, ages, frame_buf.data() + (size_t)py * row_bytes);
+                if (fwrite(frame_buf.data(),1,frame_bytes,stdout) != frame_bytes) { pipe_ok=false; break; }
+            }
         }
 
         if (gen % 100 == 0 || gen % 1000 == 0 || gen == 1) fflush(stdout);
@@ -1801,6 +2101,262 @@ static void run_render(const std::string& gol_path, int rW, int rH, int FPS, int
     double total = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wall0).count();
     fprintf(stderr,"\nDone. %d frames in %.1fs (%.1f fps)\n", total_frames, total, total_frames/total);
     free(ages);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sparse render mode — cluster active blocks → proportional panels → RGB24
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Cluster {
+    int r0, c0, r1, c1; // bbox in cell coords
+    long long area;
+};
+
+static int clamp(int v, int lo, int hi) { return v<lo ? lo : (v>hi ? hi : v); }
+
+static void run_sparse_render(const std::string& gol_path, int out_w, int out_h,
+                               int max_frames, int cluster_gap) {
+    SET_STDOUT_BINARY();
+
+    // Read header
+    FILE* fh = fopen(gol_path.c_str(), "rb");
+    if (!fh) { fprintf(stderr,"Cannot open '%s'\n",gol_path.c_str()); return; }
+    uint8_t hdr[64];
+    if (fread(hdr,1,64,fh)!=64 || hdr[0]!='G'||hdr[1]!='O'||hdr[2]!='L'||hdr[3]!='1') {
+        fprintf(stderr,"Not a valid .gol file\n"); fclose(fh); return;
+    }
+    auto ru32=[](uint8_t* p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);};
+    int W=ru32(hdr+4), H=ru32(hdr+8);
+    fclose(fh);
+
+    size_t nbytes = ((size_t)W*H+7)/8;
+    int BS=128, BPB=BS*8;
+    int nblocks = (int)((nbytes+BS-1)/BS);
+
+    const int MARGIN=8, PADDING=6, MIN_PANEL=16;
+
+    // Age color LUT (same as run_render)
+    uint8_t age_lut_r[129]={0}, age_lut_g[129]={0}, age_lut_b[129]={0};
+    for (int a=1; a<=128; a++) {
+        float t=(a-1)/127.0f;
+        if (t<0.15f)      { float s=t/0.15f; age_lut_r[a]=255; age_lut_g[a]=255; age_lut_b[a]=(uint8_t)(255*(1-s)); }
+        else if (t<0.38f) { float s=(t-0.15f)/0.23f; age_lut_r[a]=255; age_lut_g[a]=(uint8_t)(255*(1-s*0.45f)); age_lut_b[a]=0; }
+        else if (t<0.60f) { float s=(t-0.38f)/0.22f; age_lut_r[a]=255; age_lut_g[a]=(uint8_t)(140+60*(1-s)); age_lut_b[a]=0; }
+        else if (t<0.78f) { float s=(t-0.60f)/0.18f; age_lut_r[a]=(uint8_t)(255-255*s); age_lut_g[a]=200; age_lut_b[a]=(uint8_t)(60+195*s); }
+        else              { float s=(t-0.78f)/0.22f; age_lut_r[a]=0; age_lut_g[a]=(uint8_t)(80-60*s); age_lut_b[a]=(uint8_t)(255-175*s); }
+    }
+
+    // State
+    std::vector<uint8_t> ages((size_t)H*W, 0);
+    std::vector<uint8_t> bits(nbytes);
+
+    GolFrameReader reader;
+    if (!reader.open(gol_path)) return;
+
+    int frame_count=0;
+    auto wall0=std::chrono::high_resolution_clock::now();
+    fprintf(stderr,"=== Sparse Render ===\n");
+    fprintf(stderr,"Grid: %dx%d  Output: %dx%d  Cluster gap: %d\n\n",W,H,out_w,out_h,cluster_gap);
+
+    uint32_t live_count;
+    while (reader.read_next(live_count, bits)) {
+        // Update ages
+        #pragma omp parallel for
+        for (int r=0; r<H; r++) {
+            size_t row_off = (size_t)r * W;
+            for (int c=0; c<W; c++) {
+                size_t idx = row_off + c;
+                int alive = (bits[idx/8] >> (idx%8)) & 1;
+                if (alive)
+                    ages[idx] = (ages[idx] >= 127) ? 127 : ages[idx] + 1;
+                else
+                    ages[idx] = 0;
+            }
+        }
+
+        // Find active blocks (non-zero 128-byte regions)
+        std::vector<int> active_blocks;
+        for (int i=0; i<nblocks; i++) {
+            size_t off = (size_t)i * BS;
+            size_t blen = std::min((size_t)BS, nbytes - off);
+            bool nonzero = false;
+            const uint64_t* w64 = (const uint64_t*)(bits.data()+off);
+            for (size_t w=0; w<blen/8 && !nonzero; w++)
+                if (w64[w]) nonzero=true;
+            if (nonzero) active_blocks.push_back(i);
+        }
+
+        // ── Cluster active blocks (2D Chebyshev, greedy + iterative merge) ──
+        std::vector<Cluster> raw;
+        for (int bi : active_blocks) {
+            int start_bit = bi * BPB;
+            int r = start_bit / W;
+            int c = start_bit % W;
+            bool placed = false;
+            for (auto& cl : raw) {
+                int dx = std::max({cl.r0 - r, r - cl.r1, 0});
+                int dy = std::max({cl.c0 - c, c - cl.c1, 0});
+                if (dx <= cluster_gap && dy <= cluster_gap) {
+                    cl.r0 = std::min(cl.r0, r);
+                    cl.c0 = std::min(cl.c0, c);
+                    cl.r1 = std::max(cl.r1, r);
+                    cl.c1 = std::max(cl.c1, c);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed)
+                raw.push_back({r, c, r, c, 0});
+        }
+
+        // Iterative merge until stable
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            std::vector<Cluster> merged;
+            std::vector<int> used(raw.size(), 0);
+            for (size_t i=0; i<raw.size(); i++) {
+                if (used[i]) continue;
+                auto& a = raw[i];
+                for (size_t j=i+1; j<raw.size(); j++) {
+                    if (used[j]) continue;
+                    auto& b = raw[j];
+                    int dx = std::max({a.r0 - b.r1, b.r0 - a.r1, 0});
+                    int dy = std::max({a.c0 - b.c1, b.c0 - a.c1, 0});
+                    if (dx <= cluster_gap && dy <= cluster_gap) {
+                        a.r0 = std::min(a.r0, b.r0);
+                        a.c0 = std::min(a.c0, b.c0);
+                        a.r1 = std::max(a.r1, b.r1);
+                        a.c1 = std::max(a.c1, b.c1);
+                        used[j] = 1;
+                        changed = true;
+                    }
+                }
+                merged.push_back(a);
+                used[i] = 1;
+            }
+            raw = std::move(merged);
+        }
+
+        // ── Tighten bboxes to actual live cells ──
+        // Convert bits to a row_bits structure for faster scanning
+        int row_bytes = (W+7)/8;
+        std::vector<Cluster> clusters;
+        for (auto& cl : raw) {
+            // Expand search region
+            int sr0 = clamp(cl.r0 - MARGIN, 0, H-1);
+            int sr1 = clamp(cl.r1 + BPB/W + 2 + MARGIN, 0, H);
+            int sc0 = clamp(cl.c0 - MARGIN, 0, W-1);
+            int sc1 = clamp(cl.c1 + BPB + MARGIN, 0, W);
+            if (sr1 <= sr0 || sc1 <= sc0) continue;
+
+            // Find min/max live cell position in region
+            int min_r=H, max_r=-1, min_c=W, max_c=-1;
+            for (int r=sr0; r<sr1; r++) {
+                size_t row_off = (size_t)r * row_bytes;
+                // Check 64-bit words for speed
+                int c0 = sc0 / 64, c1 = (sc1-1) / 64;
+                for (int cw=c0; cw<=c1; cw++) {
+                    uint64_t word = *(const uint64_t*)(bits.data() + row_off + cw*8);
+                    if (cw == c0) {
+                        int shift = sc0 % 64;
+                        word >>= shift;
+                        if (cw == c1) word &= ((1ULL << (sc1-sc0)) - 1);
+                    } else if (cw == c1) {
+                        int bits_left = sc1 - cw*64;
+                        if (bits_left < 64) word &= ((1ULL << bits_left) - 1);
+                    }
+                    if (!word) continue;
+                    int first = __builtin_ctzll(word);
+                    int last  = 63 - __builtin_clzll(word);
+                    int base = cw*64;
+                    int cc0 = base + first;
+                    int cc1 = base + last;
+                    if (cw == c0 && c0 == c1) {
+                        cc0 = sc0 + first;
+                        cc1 = sc0 + last;
+                    } else if (cw == c0) {
+                        cc0 = sc0 + first;
+                        cc1 = base + last;
+                    }
+                    if (cc0 < min_c) min_c = cc0;
+                    if (cc1 > max_c) max_c = cc1;
+                    if (r < min_r) min_r = r;
+                    if (r > max_r) max_r = r;
+                }
+            }
+            if (max_r < 0) continue;
+            long long area = (long long)(max_r-min_r+1) * (max_c-min_c+1);
+            clusters.push_back({min_r, min_c, max_r+1, max_c+1, area});
+        }
+
+        // Sort by area descending
+        std::sort(clusters.begin(), clusters.end(),
+                  [](const Cluster& a, const Cluster& b) { return a.area > b.area; });
+
+        // ── Render panels ──
+        std::vector<uint8_t> canvas((size_t)out_h * out_w * 3, 0);
+        if (!clusters.empty()) {
+            long long total_area = 0;
+            for (auto& cl : clusters) total_area += cl.area;
+            int avail_w = out_w - PADDING*2;
+            int avail_h = out_h - PADDING * ((int)clusters.size() + 1);
+            int y = PADDING;
+            for (auto& cl : clusters) {
+                if (y + MIN_PANEL >= out_h) break;
+                int slot_h = std::max(MIN_PANEL, (int)(avail_h * (double)cl.area / total_area));
+                slot_h = std::min(slot_h, out_h - y - PADDING);
+                if (slot_h < MIN_PANEL) break;
+
+                int pw = cl.c1 - cl.c0;
+                int ph = cl.r1 - cl.r0;
+                if (pw < 1 || ph < 1) break;
+
+                int pw_out = std::max(MIN_PANEL, (int)(avail_w * (double)pw / std::max(pw, ph)));
+                int ph_out = std::max(MIN_PANEL, (int)(slot_h * (double)ph / std::max(pw, ph)));
+                if (pw_out > avail_w) { pw_out = avail_w; ph_out = pw_out * ph / pw; }
+                if (ph_out > slot_h) { ph_out = slot_h; pw_out = ph_out * pw / ph; }
+                if (pw_out < MIN_PANEL) pw_out = MIN_PANEL;
+                if (ph_out < MIN_PANEL) ph_out = MIN_PANEL;
+                if (pw_out > avail_w) pw_out = avail_w;
+                if (ph_out > slot_h) ph_out = slot_h;
+
+                // Sample the age map into the panel
+                int x_off = PADDING + (avail_w - pw_out) / 2;
+                for (int py=0; py<ph_out; py++) {
+                    int gy = cl.r0 + (py * ph / ph_out);
+                    if (gy >= H) gy = H-1;
+                    size_t age_row_off = (size_t)gy * W;
+                    uint8_t* out_row = canvas.data() + ((size_t)(y+py) * out_w + x_off) * 3;
+                    for (int px=0; px<pw_out; px++) {
+                        int gx = cl.c0 + (px * pw / pw_out);
+                        if (gx >= W) gx = W-1;
+                        uint8_t a = ages[age_row_off + gx];
+                        out_row[px*3]   = age_lut_r[a];
+                        out_row[px*3+1] = age_lut_g[a];
+                        out_row[px*3+2] = age_lut_b[a];
+                    }
+                }
+                y += slot_h + PADDING;
+            }
+        }
+
+        fwrite(canvas.data(), 1, (size_t)out_h * out_w * 3, stdout);
+        frame_count++;
+
+        if (frame_count%60==0 || frame_count==1) {
+            auto now = std::chrono::high_resolution_clock::now();
+            double elapsed = std::chrono::duration<double>(now-wall0).count();
+            fprintf(stderr,"  Frame %5d  gen ???  live=%u  clusters=%zu  %.1f fps\n",
+                    frame_count, live_count, clusters.size(), frame_count/elapsed);
+        }
+
+        if (max_frames && frame_count >= max_frames) break;
+    }
+
+    fflush(stdout);
+    double total = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wall0).count();
+    fprintf(stderr,"\nDone: %d frames in %.1fs (%.1f fps)\n", frame_count, total, frame_count/total);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2609,10 +3165,17 @@ static void usage(const char* p) {
         "  %s serve  <file.gol> [port]\n"
         "    HTTP server streaming live cell coords to HTML viewer (default port 8080).\n"
         "    Open serve.html in a browser to watch.\n\n"
-        "  %s render  <file.gol> <rW> <rH> <fps> [rgb24|gray8|monow] [cx cy cw ch] [threads]\n"
-        "    rgb24 = 3 bytes/pixel age-colored (default), gray8 = 1 byte/pixel 0/255\n"
-        "    monow = 1 bit/pixel MSB-packed (lowest pipe bandwidth, uses ffmpeg pix_fmt=monow)\n"
-        "    crop renders a sub-region; for 1:1  pixel-to-cell use crop_w <= rW, crop_h <= rH\n\n"
+        "  %s render  <file.gol> <rW> <rH> <fps> [flags] [cx cy cw ch] [threads]\n"
+         "    rgb24 = 3 bytes/pixel age-colored (default), gray8 = 1 byte/pixel 0/255\n"
+         "    monow = 1 bit/pixel MSB-packed (lowest pipe bandwidth, uses ffmpeg pix_fmt=monow)\n"
+         "    binary = any live cell in pixel region -> white pixel (no age tracking, max visibility)\n"
+         "    sparse = cluster-based tiled rendering of active regions (use for sparse large grids)\n"
+         "    crop renders a sub-region; for 1:1 pixel-to-cell use crop_w <= rW, crop_h <= rH\n"
+         "    Example:  ./gol render run.gol 1920 1080 30 sparse binary | ffmpeg ...\n\n"
+        "  %s sparse-render <file.gol> <out_w> <out_h> [max_frames] [cluster_gap]\n"
+        "    Cluster-based sparse render: groups active blocks by 2D distance,\n"
+        "    sizes panels proportionally by area, pipes RGB24 to ffmpeg.\n"
+        "    Ideal for very sparse frames on large grids.\n\n"
         "Pattern names (use directly in place of state file):\n"
         "  any *.cells file in built_in_patterns/\n\n"
         "Examples:\n"
@@ -2621,7 +3184,8 @@ static void usage(const char* p) {
         "  ./gol bench 3840 2160 1000 8 glider\n"
         "  ./gol sim life.cfg                        # saves run.gol\n"
         "  ./gol render run.gol 1920 1080 60 | ffmpeg ...  # render archive to video\n"
-        "  ./gol render run.gol 7680 4320 60 0 0 7500 3750 | ...  # 1:1 tile with black padding\n\n"
+        "  ./gol render run.gol 7680 4320 60 0 0 7500 3750 | ...  # 1:1 tile with black padding\n"
+        "  ./gol sparse-render big32k.gol 1920 1080 500 | ffmpeg ...\n\n"
         "Video pipe:\n"
         "  ./gol video 3840 2160 600 60 1920 1080 8 | ffmpeg \\\n"
         "    -f rawvideo -pixel_format rgb24 -video_size 1920x1080 -framerate 60 -i - \\\n"
@@ -2631,7 +3195,7 @@ static void usage(const char* p) {
         "  ./gol sim life.cfg\n"
         "  ./gol archive-info run.gol\n\n"
         "Rules: B3/S23 (Conway)  B36/S23 (HighLife)  B3/S12345 (Maze)  B2/S (Seeds)\n",
-         p,p,p,p,p,p,p,p,p,p,p);
+         p,p,p,p,p,p,p,p,p,p,p,p);
 }
 
 int main(int argc, char** argv) {
@@ -2645,6 +3209,14 @@ int main(int argc, char** argv) {
     if (mode=="archive-info") {
         if (argc<3) { fprintf(stderr,"Usage: %s archive-info <file.gol>\n",argv[0]); return 1; }
         archive_info(argv[2]); return 0;
+    }
+    if (mode=="sparse-render") {
+        if (argc<5) { usage(argv[0]); return 1; }
+        int ow=atoi(argv[3]), oh=atoi(argv[4]);
+        int maxf = (argc>5) ? atoi(argv[5]) : 0;
+        int gap  = (argc>6) ? atoi(argv[6]) : 100;
+        run_sparse_render(argv[2], ow, oh, maxf, gap);
+        return 0;
     }
     if (mode=="analyse") {
         if (argc<3) { fprintf(stderr,"Usage: %s analyse <file.gol>\n",argv[0]); return 1; }
@@ -2727,15 +3299,22 @@ int main(int argc, char** argv) {
         std::string pix_fmt = "rgb24";
         int cx=0, cy=0, cw=0, ch=0;
         int threads = omp_get_max_threads();
+        bool sparse = false;
+        int cluster_gap = 100;
+        bool binary = false;
 
-        // Parse positional args after the required 5: [fmt] or [cx cy cw ch] or [cx cy cw ch threads]
+        // Parse positional args after the required 5: flags+fmt then crop/threads
         int idx = 6;
-        if (idx < argc) {
+        while (idx < argc) {
             std::string a = argv[idx];
             if (a == "rgb24" || a == "gray8" || a == "monow") {
-                pix_fmt = a;
-                idx++;
-            }
+                pix_fmt = a; idx++;
+            } else if (a == "sparse") {
+                sparse = true; idx++;
+                if (idx < argc && isdigit(argv[idx][0])) { cluster_gap = atoi(argv[idx]); idx++; }
+            } else if (a == "binary") {
+                pix_fmt = "rgb24"; binary = true; idx++;
+            } else { break; }
         }
         if (idx + 4 <= argc) {
             cx = atoi(argv[idx]); cy = atoi(argv[idx+1]);
@@ -2745,7 +3324,7 @@ int main(int argc, char** argv) {
         } else if (idx < argc) {
             threads = atoi(argv[idx]);
         }
-        run_render(argv[2], rW, rH, FPS, threads, pix_fmt, cx, cy, cw, ch);
+        run_render(argv[2], rW, rH, FPS, threads, pix_fmt, cx, cy, cw, ch, sparse, cluster_gap, binary);
         return 0;
     }
 

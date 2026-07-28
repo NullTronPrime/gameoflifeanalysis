@@ -1,0 +1,13 @@
+!Name: Two eaters
+!Author: Bill Gosper
+!A period 3 oscillator that was found in September 1971.
+!www.conwaylife.com/wiki/index.php?title=Two_eaters
+!
+OO.......
+.O.......
+.O.O.....
+..OO.....
+.....OO..
+.....O.O.
+.......O.
+.......OO

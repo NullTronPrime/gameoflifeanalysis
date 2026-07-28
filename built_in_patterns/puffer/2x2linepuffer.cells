@@ -1,0 +1,12 @@
+!Name: 2x2 line puffer
+!Author: Nathaniel Johnston
+!The first known pattern to exhibit infinite growth in 2x2.
+!www.conwaylife.com/wiki/index.php?title=2x2
+!
+....O
+...O.
+..O..
+O....
+O..O.
+O.O..
+..O..

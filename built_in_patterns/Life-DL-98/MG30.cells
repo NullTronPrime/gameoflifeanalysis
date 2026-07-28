@@ -1,0 +1,19 @@
+!Name: MG30
+!Cp30 MWSS gun
+!C
+!CA p30 MWSS gun cannot be built by synthesizing the MWSS by the standard
+!Cthree glider reaction because one of the incoming gliders for the next MWSS
+!Cwould collide with the outgoing previous MWSS.
+!C
+!CThe device shown here works by hammering a p30 LWSS stream with objects
+!Cfrom opposite sides. The upper hammer is simply a p30 oscillator (Eureka by Dave
+!CBuckingham and Robert Wainwright). Its usefulness as a hammer was first
+!Cdiscovered by Noam Elkies. The hammer "down under" was found, appropriately,
+!Cby David Bell. Other Life workers contributed to the arrangement of the
+!Ccomponents to achieve a small bounding box. At the time of this writing (June
+!C1998) this is the smallest known p30 MWSS gun.
+!C
+!CDavid Bell, Noam Elkies, David Eppstein and Dieter Leithner, 11 Apr 1998
+!Source: Life-DL-98
+!
+OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO.OOOOOOOOOOOOOO.OOOOOOOOOOOOOO

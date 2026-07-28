@@ -1,0 +1,25 @@
+!Name: edgespark-i1
+!C A period 3 c/3 spaceship with an edge which can perturb some things.
+!C The ship is able to perturb some things by preventing a new cell from
+!C being created in a "corner".  Many other ships can have this same edge,
+!C but this one is among the smallest.
+!C Jason Summers
+!Source: jslife-moving
+!
+......OOO...
+..O.OO...O..
+.OOO...O.O..
+O...O....OO.
+.O.......OOO
+.......O.O..
+......OO....
+.....O...O..
+.........O..
+......O.OO..
+......O.....
+......OOO...
+.......O....
+.......OO...
+.........O..
+.......OO...
+.......O.O..

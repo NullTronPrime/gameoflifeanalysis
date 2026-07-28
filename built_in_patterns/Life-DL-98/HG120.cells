@@ -1,0 +1,16 @@
+!Name: HG120
+!Cp120 HWSS gun
+!C
+!CThe gun uses a p120 glider gun, a p30 glider to Herschel converter by Paul
+!CCallahan, a pre-Herschel to pi converter and a pi to HWSS converter by Dave
+!CBuckingham simplified by Bill Gosper. The gun has a bounding box of 46 * 64 =
+!C2944. At the time of this writing (June 1998) it is the smallest HWSS gun of any
+!Cperiod.
+!C
+!C[Editor's (Jan 2002): Smaller HWSS guns are now known, such as a
+!C 39 * 58 = 2262 p184 gun.]
+!C
+!CDieter Leithner, 15 Aug 1997
+!Source: Life-DL-98
+!
+OOOOOOOOOOOOOOOOOOOOOOOOOOO..OOOOOOOOOOOOOOOO

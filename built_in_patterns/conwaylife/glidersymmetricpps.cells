@@ -1,0 +1,16 @@
+!Name: Glider symmetric PPS
+!A period 30 c/5 orthogonal spaceship in which a pre-pulsar is pushe
+!d by two spiders. An extra T-tetromino also appears between the two
+!spiders.
+!www.conwaylife.com/wiki/index.php?title=Pre-pulsar_spaceship
+!
+...............................O.....O...............................
+..............................OOO...OOO..............................
+..OO.....OO.....OO.....OO...................OO.....OO.....OO.....OO..
+O...O...O..O...O..O...O...O...............O...O...O..O...O..O...O...O
+O...O.O.OOO.....OOO.O.O...O...OOO.........O...O.O.OOO.....OOO.O.O...O
+O.....OO..OOO.OOO..OO.....O....O..........O.....OO..OOO.OOO..OO.....O
+OO.OOO...............OOO.OO...............OO.OOO...............OOO.OO
+O.........................O...............O.........................O
+.O...O...............O...O.................O...O...............O...O.
+..O..O...............O..O...................O..O...............O..O..

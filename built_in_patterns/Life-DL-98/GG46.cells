@@ -1,0 +1,13 @@
+!Name: GG46
+!CSquared p46 glider gun
+!C
+!CWhen I found this p46 glider gun I called it a squared gun because it fitted inside
+!Ca 32 * 32 square. Later the gun's bounding box was improved by Stephen Silver
+!Cwith his warped eater2 to 32 * 31. Because of its shape this gun may fit better into
+!Csome constructions than other p46 glider guns. See for example the pattern
+!CCOE_GUN.LIF.
+!C
+!CDieter Leithner, 28 Apr 1996, impoved by Stephen Silver, 3 Jun 1998
+!Source: Life-DL-98
+!
+OO............OOOOOOOOOOOOOOOOOO
